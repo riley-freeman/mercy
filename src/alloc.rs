@@ -12,6 +12,10 @@ pub trait AllocatesTypes: Allocator + Sized {
     fn new_box<T>(&mut self, val: T) -> Result<super::boxed::Box<T>, Error> {
         crate::boxed::Box::new(self, val)
     }
+
+    fn new_arc<T: 'static>(&mut self, val:T) -> Result<super::sync::Arc<T>, Error> {
+        crate::sync::Arc::new(self, val)
+    }
 }
 
 impl<T> AllocatesTypes for T
@@ -39,6 +43,11 @@ pub fn free(id: &u128) {
 
 pub fn map_id(id: &u128) -> Option<*mut u8> {
     let implementation = *id as u16;
+
+    if id.eq(&0_u128) {
+        return None;
+    }
+
     match implementation {
         0 => {
             // Try getting the context

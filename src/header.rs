@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::{any::TypeId, hash::{Hash, Hasher, DefaultHasher}, sync::atomic::{AtomicBool, AtomicU64}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Version {
@@ -39,4 +39,10 @@ impl Default for MercyHeader {
             locked: AtomicBool::new(false),
         }
     }
+}
+
+pub fn typeid_to_u64(id: TypeId) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
 }

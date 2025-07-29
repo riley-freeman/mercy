@@ -2,6 +2,7 @@ pub mod alloc;
 pub mod context;
 pub mod error;
 pub mod boxed;
+pub mod sync;
 
 mod mapping;
 mod header;
@@ -16,6 +17,8 @@ static VERSION: Version = header::Version {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+
     use crate::alloc::{Allocator, AllocatesTypes};
     use crate::context::ContextBuilder;
 
@@ -138,7 +141,41 @@ mod tests {
 
         let in_box = context.new_box(mark_sadiki).unwrap();
         println!("Person in box: {:?}", in_box.as_ref().unwrap());
+    }
 
+    #[test]
+    fn alloc_arc() {
+       let id = String::from("crayon.mercy.test.arc");
+
+        println!("Opening context with id: {}", id);
+        tracing::debug!("Opening context with id: {}", id);
+        let mut context = ContextBuilder::new(&id)
+            .build_or_open()
+            .unwrap(); 
+
+        let i = context.new_arc(u16::MAX).unwrap();
+
+        println!("Hello World: {}", &i);
+
+        let j = i.clone();
+
+        println!("Hello World: {}", &j);
+
+        std::mem::drop(j);
+
+        let k: crate::sync::Arc<dyn Any + Send + Sync> = i.clone().into();
+        let k2: crate::sync::Arc<u16> = match k.downcast() {
+            Ok(r) => {
+                println!("SUCCESS... UP...? TRANSFORMING ANY TO I32");
+                r
+            },
+            Err(_) => {
+                println!("MESSED UP TRANSFORMING ANY TO I32");
+                i.clone()
+            }
+        };
+
+        println!("Hello World: {}", &k2);
     }
 
     /*
