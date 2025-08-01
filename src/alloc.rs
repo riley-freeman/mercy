@@ -16,6 +16,10 @@ pub trait AllocatesTypes: Allocator + Sized {
     fn new_arc<T: 'static>(&mut self, val:T) -> Result<super::sync::Arc<T>, Error> {
         crate::sync::Arc::new(self, val)
     }
+
+    fn new_string(&mut self, value: &str) -> Result<super::string::String, Error> {
+        crate::string::String::new(self, value)
+    }
 }
 
 impl<T> AllocatesTypes for T

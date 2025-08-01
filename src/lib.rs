@@ -3,6 +3,7 @@ pub mod context;
 pub mod error;
 pub mod boxed;
 pub mod sync;
+pub mod string;
 
 mod mapping;
 mod header;
@@ -176,6 +177,25 @@ mod tests {
         };
 
         println!("Hello World: {}", &k2);
+    }
+
+    #[test]
+    fn the_string_test() {
+        let id = String::from("crayon.mercy.test.string");
+
+        println!("Opening context with id: {}", id);
+        tracing::debug!("Opening context with id: {}", id);
+        let mut context = ContextBuilder::new(&id)
+            .build_or_open()
+            .unwrap(); 
+
+        let mut string = context.new_string("Hello, World").unwrap();
+        println!("First Data's Contents: {}", string);
+
+        string.push_str(&mut context, " - From a concatenated x99 STRING!").unwrap();
+        println!("Second Data's Contents: {}", string);
+
+        assert_eq!(string.as_ref(), "Hello, World - From a concatenated x99 STRING!");
     }
 
     /*

@@ -165,8 +165,7 @@ impl<T> Deref for Arc<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let data = unsafe { &*(alloc::map_id(&self.data_id).unwrap() as *mut T) };
-        data
+        self.as_ref()
     }
 }
 
