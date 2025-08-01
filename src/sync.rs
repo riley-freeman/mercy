@@ -60,6 +60,14 @@ where
 }
 
 impl <T: ?Sized> Arc<T> {
+    pub fn downgrade(this: &Arc<T>) -> Result<Weak<T>, Error> {
+        unsafe {
+            this.increment_weak_count()?;
+            Ok(mem::transmute_copy(this))
+        }
+    }
+
+
     pub unsafe fn increment_strong_count(&mut self) -> Result<(), Error> {
         unsafe { self.increment_strong_count_backend() }
     }
@@ -75,6 +83,16 @@ impl <T: ?Sized> Arc<T> {
         }
     }
 
+    unsafe fn increment_weak_count(&self) -> Result<(), Error> {
+        match alloc::map_id(&self.rcs_id) {
+            Some(raw) => {
+                let rcs = unsafe {&mut *(raw as *mut ArcReferenceCounts)};
+                rcs.weaks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            None => Err(Error::BlockNotFound { allocation_id: self.rcs_id })
+        }
+    }
 
     pub unsafe fn decrement_strong_count(&mut self) -> Result<(), Error> {
         match alloc::map_id(&self.rcs_id) {
@@ -204,6 +222,90 @@ where
             rcs_id: arc.rcs_id,
             type_id: arc.type_id,
             _phantom: PhantomData,
+        }
+    }
+}
+
+pub struct Weak<T: ?Sized> {
+    _data_id:    u128,
+    rcs_id:     u128,
+    _type_id:    u64,
+    _phantom: PhantomData<T>
+}
+
+impl<T: ?Sized> Drop for Weak<T> {
+    fn drop(&mut self) {
+        unsafe { self.decrement_weak_count().unwrap() };
+    }
+}
+
+impl<T: ?Sized> Weak<T> {
+    fn _new() -> Weak<T> {
+        Weak{
+            _phantom: PhantomData,
+            _data_id: 0,
+            _type_id: 0,
+            rcs_id: 0,
+        }
+    }
+
+    pub fn upgrade(&self) -> Option<Arc<T>> {
+        match alloc::map_id(&self.rcs_id) {
+            Some(rcs_ptr) => {
+                let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
+                let count = rcs.count.load(std::sync::atomic::Ordering::Acquire);
+
+                if count != 0 {
+                    rcs.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    return unsafe { Some(mem::transmute_copy(self)) };
+
+                } else {
+                    return None
+                }
+            }
+            None => return None,
+        }
+    }
+
+    pub fn strong_count(&self) -> u32 {
+        match alloc::map_id(&self.rcs_id) {
+            Some(rcs_ptr) => {
+                let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
+                rcs.count.load(std::sync::atomic::Ordering::Acquire)
+            }
+            None => return 0,
+        }
+    }
+
+    pub fn weak_count(&self) -> u32 {
+        match alloc::map_id(&self.rcs_id) {
+            Some(rcs_ptr) => {
+                let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
+                rcs.weaks.load(std::sync::atomic::Ordering::Acquire)
+            }
+            None => return 0,
+        }
+    }
+
+    unsafe fn decrement_weak_count(&mut self) -> Result<(), Error> {
+        match alloc::map_id(&self.rcs_id) {
+            Some(raw) => {
+                let rcs = unsafe {&mut *(raw as *mut ArcReferenceCounts)};
+                let prev = rcs.weaks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+
+                if prev <= 1 {
+                    // Check the strong count
+                    let strong = rcs.count.load(std::sync::atomic::Ordering::Acquire);
+                    if strong == 0 {
+                        // Destroy the RCS 
+                        alloc::free(&self.rcs_id);
+                        self.rcs_id = 0_u128;
+                    }
+                }
+
+                Ok(())
+            },
+            None => Err(Error::BlockNotFound { allocation_id: self.rcs_id })
         }
     }
 }

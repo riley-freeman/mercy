@@ -66,7 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn test_long_context_id() {
+    fn the_long_context_id_test() {
         let id = String::from("crayon.mercy.test.this_is_an_extremely_long_id_that_should_not_be_used_in_production_because_it_is_too_long");
 
         println!("Creating context with id: {}", id);
@@ -95,7 +95,7 @@ mod tests {
     // }
 
     #[test]
-    fn alloc_kb() {
+    fn the_alloc_test() {
         let id = String::from("crayon.mercy.test");
 
         println!("Opening context with id: {}", id);
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn alloc_boxes() {
+    fn the_box_test() {
         let id = String::from("crayon.mercy.test");
 
         println!("Opening context with id: {}", id);
@@ -145,8 +145,8 @@ mod tests {
     }
 
     #[test]
-    fn alloc_arc() {
-       let id = String::from("crayon.mercy.test.arc");
+    fn the_arc_test() {
+        let id = String::from("crayon.mercy.test.arc");
 
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
@@ -196,6 +196,28 @@ mod tests {
         println!("Second Data's Contents: {}", string);
 
         assert_eq!(string.as_ref(), "Hello, World - From a concatenated x99 STRING!");
+    }
+
+    #[test]
+    fn the_weak_test() {
+        // let weak: Weak<u8> = Weak::new();
+        // assert!(weak.upgrade().is_none());
+
+        let id = String::from("crayon.mercy.test.arc");
+
+        println!("Opening context with id: {}", id);
+        tracing::debug!("Opening context with id: {}", id);
+        let mut context = ContextBuilder::new(&id)
+            .build_or_open()
+            .unwrap(); 
+
+        let i = context.new_arc(u16::MAX).unwrap();
+
+        let weak = crate::sync::Arc::downgrade(&i).unwrap();
+        assert_eq!(*weak.upgrade().unwrap().as_ref(), u16::MAX);
+        
+        std::mem::drop(i);
+        assert!(weak.upgrade().is_none());
     }
 
     /*
