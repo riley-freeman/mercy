@@ -1,5 +1,5 @@
 use crate::{alloc::{self, Allocator}, error::Error};
-use std::{marker::PhantomData, mem};
+use std::{fmt::{Debug, Display}, marker::PhantomData, mem};
 
 
 pub struct Box<T> {
@@ -35,5 +35,30 @@ impl<T> Box<T> {
 
     pub fn as_mut(&mut self) -> Option<&mut T> {
         alloc::map_id(&self.id).map(|ptr| unsafe {&mut *(ptr as *mut T)})
+    }
+}
+
+
+impl<T: Debug> Debug for Box<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match alloc::map_id(&self.id) {
+            Some(ptr) => unsafe {
+                let r = &*(ptr as *mut T);
+                r.fmt(f)
+            }
+            None => std::fmt::Result::Err(std::fmt::Error)
+        }
+    }
+}
+
+impl <T: Display> Display for Box<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match alloc::map_id(&self.id) {
+            Some(ptr) => unsafe {
+                let r = &*(ptr as *mut T);
+                r.fmt(f)
+            }
+            None => std::fmt::Result::Err(std::fmt::Error)
+        }
     }
 }

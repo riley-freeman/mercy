@@ -182,37 +182,33 @@ impl crate::alloc::Allocator for Context {
         let mercy_header = unsafe { &mut *(header_mapping.ptr_mut() as *mut MercyHeader) };
         let alloc_mask = &mut mercy_header.alloc_mask;
 
-        for i in 0.. alloc_mask.len() {
-            let mask = &mut alloc_mask[i];
-            if *mask == u64::MAX {
-                continue; // This block is full, skip it
+        let block_id = alloc_mask.find_available_id().map_or(
+            Err(error::Error::NoBlocksAvailable {requested: size as _}),
+            |id| Ok(id)
+        )?;
+
+        // Create a new mapping
+        let os_id = construct_os_id(c.id_hash, block_id as u16);
+        let mut mapping = match mapping::new_mapping(&os_id, size as usize) {
+            Ok(mapping) => mapping,
+            Err(_) => {
+                alloc_mask.reserve_id(block_id);
+                std::mem::drop(c);
+                // Try again with the corrected mask
+                return self.alloc(size);
             }
+        };
+        unsafe { mapping.set_ownership(true)}
 
-            let first_available_bit_index = (!*mask).trailing_zeros();
-            let block_id = 64 * i + first_available_bit_index as usize;
+        alloc_mask.reserve_id(block_id);
 
-            // Create a new mapping
-            let os_id = construct_os_id(c.id_hash, block_id as u16);
-            let mut mapping = match mapping::new_mapping(&os_id, size as usize) {
-                Ok(mapping) => mapping,
-                Err(_) => continue,
-            };
-            unsafe { mapping.set_ownership(true)}
+        // create an allocation ID
+        let allocation_id = (c.id_hash as u128) << 64 | (size as u128) << 32 | (block_id as u128) << 16;
 
-            // Set the bit to 1
-            *mask |= 1 << first_available_bit_index;
+        // Add the mapping to the context
+        c.mappings.insert(allocation_id, mapping);
 
-            // create an allocation ID
-            let allocation_id = (c.id_hash as u128) << 64 | (size as u128) << 32 | (block_id as u128) << 16;
-
-            // Add the mapping to the context
-            c.mappings.insert(allocation_id, mapping);
-
-            return Ok(allocation_id);
-        }
-
-        // Return null if no block is found
-        Err(error::Error::NoBlocksAvailable { requested: size as usize })
+        return Ok(allocation_id);
     }
     
     fn free(&mut self, id: u128) {
@@ -226,11 +222,7 @@ impl crate::alloc::Allocator for Context {
             let mercy_header = unsafe { &mut *(header_mapping.ptr_mut() as *mut MercyHeader) };
             let alloc_mask = &mut mercy_header.alloc_mask;
 
-            let first_level_index = (block_id / 64) as usize;
-            let second_level_index = (block_id % 64) as usize;
-
-            // Set the appropriate bit to 0
-            alloc_mask[first_level_index] &= !(1 << second_level_index);
+            alloc_mask.free_id(block_id);
         }
 
         // Remove the mapping from the context

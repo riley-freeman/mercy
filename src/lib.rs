@@ -19,6 +19,7 @@ static VERSION: Version = header::Version {
 #[cfg(test)]
 mod tests {
     use std::any::Any;
+    use std::fmt::Debug;
 
     use crate::alloc::{Allocator, AllocatesTypes};
     use crate::context::ContextBuilder;
@@ -123,7 +124,7 @@ mod tests {
             .build_or_open()
             .unwrap();
 
-        #[derive(Debug)]
+        #[derive(Debug, Clone, PartialEq)]
         #[allow(unused)]
         struct Person {
             name: [u8; 10],
@@ -138,10 +139,9 @@ mod tests {
             race: b"BLK".clone(),
             dead: false     // Not yet.
         };
-        println!("Person: {:?}", mark_sadiki);
 
-        let in_box = context.new_box(mark_sadiki).unwrap();
-        println!("Person in box: {:?}", in_box.as_ref().unwrap());
+        let in_box = context.new_box(mark_sadiki.clone()).unwrap();
+        assert_eq!(mark_sadiki, in_box.as_ref().unwrap().clone());
     }
 
     #[test]
