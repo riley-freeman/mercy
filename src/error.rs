@@ -4,6 +4,7 @@ pub enum Error {
     InvalidPermissions{id: String},
 
     IdAlreadyExists{id: String},
+    RequestedAllocInfoNotFound{id: u128},
 
     OperationUnsupported,
 
@@ -22,6 +23,7 @@ impl std::fmt::Display for Error {
             Error::InvalidPermissions{id} => write!(f, "Invalid permissions for id: {}", id),
 
             Error::IdAlreadyExists{id} => write!(f, "ID already exists: {}", id),
+            Error::RequestedAllocInfoNotFound{id} => write!(f, "ID does not contain the proper information: {}", id),
 
             Error::OperationUnsupported => write!(f, "Operation not supported on this machine"),
 

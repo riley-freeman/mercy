@@ -4,6 +4,7 @@ pub mod error;
 pub mod boxed;
 pub mod sync;
 pub mod string;
+pub mod rec;
 
 mod mapping;
 mod header;
@@ -141,7 +142,7 @@ mod tests {
         };
 
         let in_box = context.new_box(mark_sadiki.clone()).unwrap();
-        assert_eq!(mark_sadiki, in_box.as_ref().unwrap().clone());
+        assert_eq!(mark_sadiki, Person::clone(&in_box.map().unwrap()));
     }
 
     #[test]

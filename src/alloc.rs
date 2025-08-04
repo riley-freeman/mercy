@@ -69,3 +69,26 @@ pub fn map_id(id: &u128) -> Option<*mut u8> {
         }
     }
 }
+
+pub fn len(alloc_id: &u128) -> Result<u32, Error> {
+    let implementation = *alloc_id as u16;
+
+    if alloc_id.eq(&0_128) {
+        return Err(Error::BlockNotFound { allocation_id: *alloc_id })
+    }
+
+    match implementation {
+        0 => {
+            let size = (alloc_id >> 32) as u32;
+            if size != 0 {
+                Ok(size)
+            } else {
+                Err(Error::RequestedAllocInfoNotFound { id: *alloc_id })
+            }
+        }
+        _ => {
+            Err(Error::RequestedAllocInfoNotFound { id: *alloc_id })
+        }
+    }
+
+}

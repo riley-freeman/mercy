@@ -1,4 +1,4 @@
-use crate::{alloc::{self, Allocator}, error::Error};
+use crate::{alloc::{self, Allocator}, error::Error, rec::SmartRef};
 use std::{fmt::{Debug, Display}, marker::PhantomData, mem};
 
 
@@ -28,13 +28,8 @@ impl<T> Box<T> {
         })
     }
 
-
-    pub fn as_ref(&self) -> Option<&T> {
-        alloc::map_id(&self.id).map(|ptr| unsafe {&*(ptr as *mut T)})
-    }
-
-    pub fn as_mut(&mut self) -> Option<&mut T> {
-        alloc::map_id(&self.id).map(|ptr| unsafe {&mut *(ptr as *mut T)})
+    pub fn map(&self) -> Option<SmartRef<T>> {
+        SmartRef::new(self.id).ok()
     }
 }
 
