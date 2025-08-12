@@ -189,21 +189,31 @@ impl<T> SmartRef<T> {
     }
 }
 
-impl<T> Deref for SmartRef<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
+impl<T> AsRef<T> for SmartRef<T> {
+    fn as_ref(&self) -> &T {
         unsafe { &*(self.ptr as *const T) }
     }
 }
 
-impl<T> DerefMut for SmartRef<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+impl<T> AsMut<T> for SmartRef<T> {
+    fn as_mut(&mut self) -> &mut T {
         self.modified_data = Some(Vec::new());
         unsafe { &mut *(self.ptr as *mut T) }
     }
 }
 
+impl<T> Deref for SmartRef<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
 
+impl<T> DerefMut for SmartRef<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut()
+    }
+}
 
 
 #[test]

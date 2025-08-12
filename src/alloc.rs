@@ -92,3 +92,61 @@ pub fn len(alloc_id: &u128) -> Result<u32, Error> {
     }
 
 }
+
+// Not doing documentaion right now.. this doesnt free anything, it just allocates a new
+// whatever with what originally allocated the original ID... Just look at the code
+// If you have no idea what i'm talmbout fr ong.
+pub fn realloc(id: &u128, size: u32) -> Result<u128, Error> {
+    let implementation = *id as u16;
+
+    if id.eq(&0_u128) {
+        return Err(Error::OperationUnsupported);
+    }
+
+    match implementation {
+        0 => {
+            // Try getting the context
+            let context_id = (id >> 64) as u64;
+            let mut context = context::check_registered_contexts(context_id)
+                .ok_or(Error::RequestedContextNotFound { id: *id })?;
+
+            context.alloc(size)
+        }
+        _ => {
+            Err(Error::OperationUnsupported)
+        }
+    }
+}
+
+#[test]
+fn the_realloc_test() {
+    use crate::alloc::{Allocator, realloc, free};
+    use crate::context::ContextBuilder;
+
+
+    // Create a new context
+    let id = String::from("crayon.mercy.test.alloc.realloc");
+
+    println!("Creating context with id: {}", id);
+    tracing::debug!("Creating context with id: {}", id);
+    let mut context = ContextBuilder::new(&id)
+        .build_or_open()
+        .unwrap();
+    println!("Context created successfully: {:?}", context);
+
+    // Allocate a buffer
+    let one = context.alloc(64).unwrap();
+    let two = realloc(&one, 64).unwrap();
+
+    // Should be the same context
+    assert_eq!((one >> 64) as u64, (two >> 64) as u64);
+    // Should be the same size
+    assert_eq!((one >> 32) as u32, (two >> 32) as u32);
+    // Should different alloc ids
+    assert_ne!((one >> 16) as u16, (two >> 16) as u16);
+    // Should be the same implementation
+    assert_eq!(one as u16, two as u16);
+
+    free(&one);
+    free(&two);
+}

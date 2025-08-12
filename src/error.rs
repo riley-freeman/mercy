@@ -5,6 +5,8 @@ pub enum Error {
 
     IdAlreadyExists{id: String},
     RequestedAllocInfoNotFound{id: u128},
+    RequestedAllocatorNotFound{id: u128},
+    RequestedContextNotFound{id: u128},
 
     OperationUnsupported,
 
@@ -24,6 +26,8 @@ impl std::fmt::Display for Error {
 
             Error::IdAlreadyExists{id} => write!(f, "ID already exists: {}", id),
             Error::RequestedAllocInfoNotFound{id} => write!(f, "ID does not contain the proper information: {}", id),
+            Error::RequestedAllocatorNotFound{id} => write!(f, "ID does not contain a findable allocator: {}", id),
+            Error::RequestedContextNotFound{id} => write!(f, "ID does not contain a registered context: {}", id),
 
             Error::OperationUnsupported => write!(f, "Operation not supported on this machine"),
 
