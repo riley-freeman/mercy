@@ -123,7 +123,6 @@ fn the_realloc_test() {
     use crate::alloc::{Allocator, realloc, free};
     use crate::context::ContextBuilder;
 
-
     // Create a new context
     let id = String::from("crayon.mercy.test.alloc.realloc");
 

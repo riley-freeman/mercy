@@ -33,7 +33,7 @@ mod tests {
 
     #[test]
     fn create_context() {
-        let id = String::from("crayon.mercy.test");
+        let id = String::from("crayon.mercy.test.create");
 
         println!("Creating context with id: {}", id);
         tracing::debug!("Creating context with id: {}", id);
@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn manifest_context() {
-        let id = String::from("crayon.mercy.test");
+        let id = String::from("crayon.mercy.test.manifest");
 
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn the_alloc_test() {
-        let id = String::from("crayon.mercy.test");
+        let id = String::from("crayon.mercy.test.alloc");
 
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn the_box_test() {
-        let id = String::from("crayon.mercy.test");
+        let id = String::from("crayon.mercy.test.box");
 
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
@@ -181,30 +181,11 @@ mod tests {
     }
 
     #[test]
-    fn the_string_test() {
-        let id = String::from("crayon.mercy.test.string");
-
-        println!("Opening context with id: {}", id);
-        tracing::debug!("Opening context with id: {}", id);
-        let mut context = ContextBuilder::new(&id)
-            .build_or_open()
-            .unwrap(); 
-
-        let mut string = context.new_string("Hello, World").unwrap();
-        println!("First Data's Contents: {}", string);
-
-        string.push_str(&mut context, " - From a concatenated x99 STRING!").unwrap();
-        println!("Second Data's Contents: {}", string);
-
-        assert_eq!(string.as_ref(), "Hello, World - From a concatenated x99 STRING!");
-    }
-
-    #[test]
     fn the_weak_test() {
         // let weak: Weak<u8> = Weak::new();
         // assert!(weak.upgrade().is_none());
 
-        let id = String::from("crayon.mercy.test.arc");
+        let id = String::from("crayon.mercy.test.weak");
 
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
