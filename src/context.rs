@@ -1,25 +1,42 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::MutexGuard;
-use std::{sync::LazyLock, collections};
+use std::mem;
+use std::process::exit;
+use std::sync::{Arc, MutexGuard};
+use std::{collections, sync::LazyLock};
+
+use crate::pal::DispatchContext;
+#[cfg(target_os = "macos")]
+use crate::pal::apple::AppleContext;
+#[cfg(target_os = "ios")]
+use crate::pal::apple::AppleContext;
 
 use super::error;
 use super::header::MercyHeader;
 use super::mapping;
 
-static PROCESS_CONTEXTS: LazyLock<std::sync::Mutex<collections::HashMap<usize, WeakContext>>> = LazyLock::new(|| {
-    std::sync::Mutex::new(collections::HashMap::new())
-});
+static PROCESS_CONTEXTS: LazyLock<std::sync::Mutex<collections::HashMap<usize, WeakContext>>> =
+    LazyLock::new(|| std::sync::Mutex::new(collections::HashMap::new()));
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBuilder {
     id: String,
+    jobs: HashMap<String, Box<dyn FnOnce(Result<Context, error::Error>) -> ()>>,
+}
+
+impl std::fmt::Debug for ContextBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextBuilder")
+            .field("id", &self.id)
+            .field("jobs", &self.jobs.keys())
+            .finish()
+    }
 }
 
 impl ContextBuilder {
     pub fn new(id: &str) -> Self {
         ContextBuilder {
             id: String::from(id),
+            jobs: HashMap::new(),
         }
     }
 
@@ -28,24 +45,73 @@ impl ContextBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Context, error::Error> {
-        ContextInner::new(&self.id)
+    pub fn main(
+        mut self,
+        main: impl FnOnce(Result<Context, error::Error>) -> () + 'static,
+    ) -> Self {
+        self.jobs.insert("main".to_string(), Box::new(main));
+        self
     }
 
-    pub fn open(self) -> Result<Context, error::Error> {
-        ContextInner::open(&self.id, false)
+    pub fn add_job(
+        mut self,
+        job: &str,
+        main: impl FnOnce(Result<Context, error::Error>) -> () + 'static,
+    ) -> Self {
+        if job.eq("main") || job.eq("manager") {
+            panic!(
+                "{}",
+                crate::error::Error::JobNameReserved {
+                    name: job.to_string()
+                }
+            );
+        }
+
+        self.jobs.insert(job.to_string(), Box::new(main));
+        self
     }
 
-    pub fn build_or_open(self) -> Result<Context, error::Error> {
-        match ContextInner::new(&self.id) {
+    pub fn build(mut self) -> ! {
+        let context = ContextInner::new(&self.id);
+        let job_name = option_env!("CRAYON_MERCY_JOB_NAME").unwrap_or("main");
+
+        let job = self
+            .jobs
+            .remove(job_name)
+            .expect(&format!("Job {} not found", job_name));
+        job(context);
+
+        exit(0)
+    }
+
+    pub fn open(mut self) -> ! {
+        let context = ContextInner::open(&self.id, false);
+        let job_name = option_env!("CRAYON_MERCY_JOB_NAME").unwrap_or("main");
+
+        let job = self
+            .jobs
+            .remove(job_name)
+            .expect(&format!("Job {} not found", job_name));
+        job(context);
+
+        exit(0)
+    }
+
+    pub fn build_or_open(mut self) -> ! {
+        let context = match ContextInner::new(&self.id) {
             Ok(context) => Ok(context),
             // Open if it already exists
-            Err(error::Error::IdAlreadyExists { id: _ }) => { 
-                let context = ContextInner::open(&self.id, true)?;
-                Ok(context)
-            },
+            Err(error::Error::IdAlreadyExists { id: _ }) => ContextInner::open(&self.id, true),
             Err(e) => Err(e),
-        }
+        };
+
+        let job_name = option_env!("CRAYON_MERCY_JOB_NAME").unwrap_or("main");
+        let job = self
+            .jobs
+            .remove(job_name)
+            .expect(&format!("Job {} not found", job_name));
+        job(context);
+        exit(0)
     }
 }
 
@@ -53,84 +119,27 @@ impl ContextBuilder {
 pub struct ContextInner {
     id: String,
     id_hash: u64,
-    header_id: u128,
+    header_id: u16,
     mappings: std::collections::HashMap<u128, Box<dyn mapping::Mapping>>,
+    dispatch: std::boxed::Box<dyn DispatchContext>,
 }
 
 impl ContextInner {
-    fn new (id: &str) -> Result<Context, error::Error> {
+    fn new(id: &str) -> Result<Context, error::Error> {
+        #[cfg(target_os = "macos")]
+        let dispatch = std::boxed::Box::new(AppleContext::new(id));
+        #[cfg(target_os = "ios")]
+        let dispatch = std::boxed::Box::new(AppleContext::new(id));
+
         let id_hash = hash_id(id);
-
-        // Lock the process contexts
-        let mut guard = lock_context_database();
-
-
-        // Check the process contexts
-        if let Some(context) = check_locked_contexts(&guard, id_hash) {
-            return Ok(context);
-        }
-
-        // Continue with creating the context
-        let os_id = construct_os_id(id_hash, 0);
-
-        let size = size_of::<MercyHeader>();
-        let mapping = mapping::new_mapping(&os_id, size)?;
-        let header_id = (id_hash as u128) << 64 | (size as u128) << 32 | 0_u128 << 16;
-
-        let mut mappings = std::collections::HashMap::new();
-        mappings.insert(header_id, mapping);
+        let header_id = 0; // TODO: Source this correctly
 
         let context_inner = ContextInner {
             id: String::from(id),
             id_hash,
             header_id,
-            mappings
-        };
-
-        let context = Context { 
-            inner: std::sync::Arc::new(std::sync::Mutex::new(context_inner)),
-            id: String::from(id),
-            id_hash,
-            header_id,
-        };
-
-        // Add the context to the process contexts
-        register_context(&mut guard, &context);
-
-        Ok(context)
-    }
-
-    fn open(id: &str, take_ownership: bool) -> Result<Context, error::Error> {
-        let id_hash = hash_id(id);
-
-        // Lock the process contexts
-        let mut guard = lock_context_database();
-
-        // Check the process contexts
-        if let Some(context) = check_locked_contexts(&guard, id_hash) {
-            return Ok(context);
-        }
-
-        // Continue with opening the context
-        let os_id = construct_os_id(id_hash, 0);
-
-        let size = size_of::<MercyHeader>();
-        let header_id = (id_hash as u128) << 64 | (size as u128) << 32 | 0_u128 << 16;
-        let mut mapping = mapping::open_mapping(&os_id)?;
-
-        // Take ownership if requested
-        if take_ownership {
-            unsafe { mapping.set_ownership(true) };
-        }
-
-        let mut mappings = std::collections::HashMap::new();
-        mappings.insert(header_id, mapping);
-
-        let context_inner = ContextInner {
-            id: String::from(id),
-            id_hash,
-            header_id,
-            mappings,
+            mappings: HashMap::new(),
+            dispatch,
         };
 
         let context = Context {
@@ -141,19 +150,50 @@ impl ContextInner {
         };
 
         // Add the context to the process contexts
+        let mut guard = PROCESS_CONTEXTS.lock().unwrap();
+        register_context(&mut guard, &context);
+
+        Ok(context)
+    }
+
+    fn open(id: &str, _take_ownership: bool) -> Result<Context, error::Error> {
+        #[cfg(target_os = "macos")]
+        let dispatch = Box::new(AppleContext::new(id));
+        #[cfg(target_os = "ios")]
+        let dispatch = Box::new(AppleContext::new(id));
+
+        let id_hash = hash_id(id);
+        let header_id = 0; // TODO: Source this correctly
+
+        let context_inner = ContextInner {
+            id: String::from(id),
+            id_hash,
+            header_id,
+            mappings: HashMap::new(),
+            dispatch,
+        };
+
+        let context = Context {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(context_inner)),
+            id: String::from(id),
+            id_hash,
+            header_id,
+        };
+
+        // Add the context to the process contexts
+        let mut guard = PROCESS_CONTEXTS.lock().unwrap();
         register_context(&mut guard, &context);
 
         Ok(context)
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct Context {
     inner: std::sync::Arc<std::sync::Mutex<ContextInner>>,
     id: String,
     id_hash: u64,
-    header_id: u128,
+    header_id: u16,
 }
 type WeakContext = std::sync::Weak<std::sync::Mutex<ContextInner>>;
 
@@ -161,102 +201,19 @@ impl Context {
     pub fn id(&self) -> String {
         self.id.clone()
     }
-
-    pub fn id_hash(&self) -> u64 {
-        self.id_hash
-    }
-
-    pub fn header_alloc_id(&self) -> u128 {
-        self.header_id
-    }
 }
 
 impl crate::alloc::Allocator for Context {
     fn alloc(&mut self, size: u32) -> Result<u128, error::Error> {
-        let mut c = self.inner.lock().unwrap();
-
-        let header_id = c.header_id;
-
-        // Get the first available bit from the block mask
-        let header_mapping = c.mappings.get_mut(&header_id).ok_or(error::Error::OperationUnsupported)?;
-        let mercy_header = unsafe { &mut *(header_mapping.ptr_mut() as *mut MercyHeader) };
-        let alloc_mask = &mut mercy_header.alloc_mask;
-
-        let block_id = alloc_mask.find_available_id().map_or(
-            Err(error::Error::NoBlocksAvailable {requested: size as _}),
-            |id| Ok(id)
-        )?;
-
-        // Create a new mapping
-        let os_id = construct_os_id(c.id_hash, block_id as u16);
-        let mut mapping = match mapping::new_mapping(&os_id, size as usize) {
-            Ok(mapping) => mapping,
-            Err(_) => {
-                alloc_mask.reserve_id(block_id);
-                std::mem::drop(c);
-                // Try again with the corrected mask
-                return self.alloc(size);
-            }
-        };
-        unsafe { mapping.set_ownership(true)}
-
-        alloc_mask.reserve_id(block_id);
-
-        // create an allocation ID
-        let allocation_id = (c.id_hash as u128) << 64 | (size as u128) << 32 | (block_id as u128) << 16;
-
-        // Add the mapping to the context
-        c.mappings.insert(allocation_id, mapping);
-
-        return Ok(allocation_id);
+        self.inner.lock().unwrap().dispatch.alloc(size)
     }
-    
+
     fn free(&mut self, id: u128) {
-        let mut c = self.inner.lock().unwrap();
-        let block_id = (id >> 16) as u16;
+        self.inner.lock().unwrap().dispatch.free(id)
+    }
 
-        let header_id = c.header_id;
-
-        // Get the header mapping
-        if let Some(header_mapping) = c.mappings.get_mut(&header_id) {
-            let mercy_header = unsafe { &mut *(header_mapping.ptr_mut() as *mut MercyHeader) };
-            let alloc_mask = &mut mercy_header.alloc_mask;
-
-            alloc_mask.free_id(block_id);
-        }
-
-        // Remove the mapping from the context
-        let _ = c.mappings.remove(&id);
-    } 
-
-    fn map_id(&mut self, id: u128) -> Option<*mut u8> {
-        let mut c = self.inner.lock().unwrap();
-        let mapping = match c.mappings.get_mut(&id) {
-            Some(mapping) => mapping,
-            None => {
-                // Create the mapping in the context.
-                let context_id = (id >> 64) as u64;
-                let _size = (id >> 32) as u32;
-                let block_id = (id >> 16) as u16;
-
-                let os_id = construct_os_id(context_id, block_id);
-                let mut mapping = match mapping::open_mapping(&os_id) {
-                    Ok(mapping) => mapping,
-                    Err(_) => { return None; }
-                };
-
-                // Make ourselves the owner if the context ID matches
-                if context_id == c.id_hash {
-                    unsafe { mapping.set_ownership(true) }
-                }
-
-                c.mappings.insert(id, mapping);
-                c.mappings.get_mut(&id).unwrap()
-            }
-        };
-        
-        // Return the pointer to the mapping
-        Some(mapping.ptr_mut())
+    fn map_id(&mut self, id: u128) -> Result<*mut u8, error::Error> {
+        self.inner.lock().unwrap().dispatch.map_id(id)
     }
 }
 
@@ -270,19 +227,22 @@ impl Drop for ContextInner {
     }
 }
 
-pub fn lock_context_database<'a>() ->  MutexGuard<'a, HashMap<usize, WeakContext>> {
+pub fn lock_context_database<'a>() -> MutexGuard<'a, HashMap<usize, WeakContext>> {
     PROCESS_CONTEXTS.lock().unwrap()
 }
 
 fn register_context(guard: &mut MutexGuard<HashMap<usize, WeakContext>>, context: &Context) {
     let id_hash = context.inner.lock().unwrap().id_hash;
     if guard.contains_key(&(id_hash as usize)) {
-        return;     // Start praying.
+        return; // Start praying.
     }
     guard.insert(id_hash as usize, std::sync::Arc::downgrade(&context.inner));
 }
 
-fn check_locked_contexts(guard: &MutexGuard<HashMap<usize, WeakContext>>, id_hash: u64) -> Option<Context> {
+fn check_locked_contexts(
+    guard: &MutexGuard<HashMap<usize, WeakContext>>,
+    id_hash: u64,
+) -> Option<Context> {
     if let Some(context) = guard.get(&(id_hash as _)) {
         if let Some(context) = context.upgrade() {
             let context_inner = context.lock().unwrap();
@@ -297,7 +257,7 @@ fn check_locked_contexts(guard: &MutexGuard<HashMap<usize, WeakContext>>, id_has
                 inner: context,
                 id,
                 id_hash,
-                header_id
+                header_id,
             };
 
             return Some(context);

@@ -1,10 +1,17 @@
-use crate::{alloc::{self, Allocator}, error::Error, rec::SmartRef};
-use std::{fmt::{Debug, Display}, marker::PhantomData, mem};
-
+use crate::{
+    alloc::{self, Allocator},
+    error::Error,
+    rec::State,
+};
+use std::{
+    fmt::{Debug, Display},
+    marker::PhantomData,
+    mem, ptr,
+};
 
 pub struct Box<T> {
     id: u128,
-    _phantom: PhantomData<T>
+    _phantom: PhantomData<T>,
 }
 
 impl<T> Drop for Box<T> {
@@ -24,36 +31,35 @@ impl<T> Box<T> {
 
         Ok(Box::<T> {
             id,
-            _phantom: PhantomData
+            _phantom: PhantomData,
         })
     }
 
-    pub fn map(&self) -> Option<SmartRef<T>> {
-        SmartRef::new(self.id).ok()
+    pub fn map(&self) -> Option<State<T>> {
+        State::new(self.id).ok()
     }
 }
-
 
 impl<T: Debug> Debug for Box<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match alloc::map_id(&self.id) {
-            Some(ptr) => unsafe {
+            Ok(ptr) => unsafe {
                 let r = &*(ptr as *mut T);
                 r.fmt(f)
-            }
-            None => std::fmt::Result::Err(std::fmt::Error)
+            },
+            Err(_) => std::fmt::Result::Err(std::fmt::Error),
         }
     }
 }
 
-impl <T: Display> Display for Box<T> {
+impl<T: Display> Display for Box<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match alloc::map_id(&self.id) {
-            Some(ptr) => unsafe {
+            Ok(ptr) => unsafe {
                 let r = &*(ptr as *mut T);
                 r.fmt(f)
-            }
-            None => std::fmt::Result::Err(std::fmt::Error)
+            },
+            Err(_) => std::fmt::Result::Err(std::fmt::Error),
         }
     }
 }

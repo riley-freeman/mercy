@@ -1,10 +1,15 @@
 use core::{fmt, slice};
-use std::{fmt::Display, ops::{Add, AddAssign, Deref}};
+use std::{
+    fmt::Display,
+    ops::{Add, AddAssign, Deref},
+};
 
 use libc::strlen;
 
-use crate::{alloc::{self, Allocator}, error::Error};
-
+use crate::{
+    alloc::{self, Allocator},
+    error::Error,
+};
 
 pub struct String {
     id: u128,
@@ -22,25 +27,21 @@ impl String {
         let id = allocator.alloc(len as u32 + 1)?;
 
         // Write the (only byte) data into the buffer
-        let ptr = match allocator.map_id(id) {
-            Some(ptr) => ptr,
-            // Ok mf... im drunk as fuck... I KNOW. there is a better way to do this shit... one that looks better... but take that up with the judge bitch.
-            None => return Err(Error::BlockNotFound { allocation_id: id })
-        };
+        let ptr = allocator.map_id(id)?;
 
         unsafe {
             libc::memcpy(ptr as _, value.as_ptr() as _, len);
-            libc::memcpy(ptr.byte_add(len) as _ , &0 as *const _ as _, 1);
+            libc::memcpy(ptr.byte_add(len) as _, &0 as *const _ as _, 1);
         }
 
-        Ok(String {id})
+        Ok(String { id })
     }
 
     pub fn push(&mut self, c: char) -> Result<(), Error> {
         self.push_str(&c.to_string())
     }
 
-    pub fn push_str(&mut self, string: &str)  -> Result<(), Error> {
+    pub fn push_str(&mut self, string: &str) -> Result<(), Error> {
         // Create the old string
         let og_str = unsafe {
             let ptr = alloc::map_id(&self.id).unwrap();
@@ -56,7 +57,7 @@ impl String {
             let ptr = alloc::map_id(&new_id).unwrap();
             let len = new_str.len();
             libc::memcpy(ptr as _, new_str.as_ptr() as _, len);
-            libc::memcpy(ptr.byte_add(len)as _, &0 as *const _ as _, 1);
+            libc::memcpy(ptr.byte_add(len) as _, &0 as *const _ as _, 1);
         }
 
         // Free that old shit lowkey
@@ -67,11 +68,11 @@ impl String {
     }
 
     pub fn try_clone(&self) -> Result<Self, Error> {
-        let ptr = alloc::map_id(&self.id).ok_or(Error::BlockNotFound { allocation_id: self.id })?;
+        let ptr = alloc::map_id(&self.id)?;
         let len = unsafe { strlen(ptr as _) } + 1;
-        
+
         let new_id = alloc::realloc(&self.id, len as _)?;
-        let new_ptr = alloc::map_id(&new_id).ok_or(Error::BlockNotFound { allocation_id: self.id })?;
+        let new_ptr = alloc::map_id(&new_id)?;
 
         unsafe { libc::memcpy(new_ptr as _, ptr as _, len) };
 
@@ -79,7 +80,7 @@ impl String {
     }
 }
 
-impl AsRef<str>  for String {
+impl AsRef<str> for String {
     fn as_ref(&self) -> &str {
         unsafe {
             let ptr = alloc::map_id(&self.id).unwrap();
@@ -91,7 +92,7 @@ impl AsRef<str>  for String {
 }
 
 impl Deref for String {
-    type Target = str; 
+    type Target = str;
     fn deref(&self) -> &Self::Target {
         self.as_ref()
     }
@@ -139,89 +140,99 @@ impl<'a> Extend<&'a char> for String {
 
 impl<'a> Extend<&'a str> for String {
     fn extend<T: IntoIterator<Item = &'a str>>(&mut self, iter: T) {
-        iter.into_iter().for_each(move |s| self.push_str(s).unwrap());
+        iter.into_iter()
+            .for_each(move |s| self.push_str(s).unwrap());
     }
 }
 
 impl<'a> Extend<String> for String {
     fn extend<T: IntoIterator<Item = String>>(&mut self, iter: T) {
-        iter.into_iter().for_each(move |s| self.push_str(&s).unwrap());
+        iter.into_iter()
+            .for_each(move |s| self.push_str(&s).unwrap());
     }
 }
 
 impl<'a> Extend<std::string::String> for String {
     fn extend<T: IntoIterator<Item = std::string::String>>(&mut self, iter: T) {
-        iter.into_iter().for_each(move |s| self.push_str(&s).unwrap());
+        iter.into_iter()
+            .for_each(move |s| self.push_str(&s).unwrap());
     }
 }
 
-
 #[test]
 fn the_string_test() {
-    use crate::context::ContextBuilder;
     use crate::alloc::AllocatesTypes;
+    use crate::context::ContextBuilder;
 
     let id = std::string::String::from("crayon.mercy.test.string");
 
     println!("Opening context with id: {}", id);
     tracing::debug!("Opening context with id: {}", id);
-    let mut context = ContextBuilder::new(&id)
-        .build_or_open()
-        .unwrap(); 
+    ContextBuilder::new(&id)
+        .main(|res| {
+            let mut context = res.unwrap();
+            let mut string = context.new_string("Hello, World").unwrap();
+            assert_eq!(string.as_ref(), "Hello, World");
 
-    let mut string = context.new_string("Hello, World").unwrap();
-    assert_eq!(string.as_ref(), "Hello, World");
+            string.push_str(", from a concatenated x99 STRING").unwrap();
+            assert_eq!(
+                string.as_ref(),
+                "Hello, World, from a concatenated x99 STRING"
+            );
 
-    string.push_str(", from a concatenated x99 STRING").unwrap();
-    assert_eq!(string.as_ref(), "Hello, World, from a concatenated x99 STRING");
+            let string = string + " - x99 MERCY!";
+            assert_eq!(
+                string.as_ref(),
+                "Hello, World, from a concatenated x99 STRING - x99 MERCY!"
+            );
 
-    let string = string + " - x99 MERCY!";
-    assert_eq!(string.as_ref(), "Hello, World, from a concatenated x99 STRING - x99 MERCY!");
+            let mut string = context.new_string("August").unwrap();
+            string += " 13";
+            string += ", 2025";
 
-
-    let mut string = context.new_string("August").unwrap();
-    string += " 13";
-    string += ", 2025";
-
-    assert_eq!(string.as_ref(), "August 13, 2025");
+            assert_eq!(string.as_ref(), "August 13, 2025");
+        })
+        .build_or_open();
 }
 
 #[test]
 fn the_extend_test() {
-    use crate::context::ContextBuilder;
     use crate::alloc::AllocatesTypes;
+    use crate::context::ContextBuilder;
 
     let id = std::string::String::from("crayon.mercy.test.string.extend");
 
     println!("Opening context with id: {}", id);
     tracing::debug!("Opening context with id: {}", id);
-    let mut context = ContextBuilder::new(&id)
-        .build_or_open()
-        .unwrap();
+    ContextBuilder::new(&id)
+        .main(|res| {
+            let mut context = res.unwrap();
+            let mut string = context.new_string("").unwrap();
 
-    let mut string = context.new_string("").unwrap();
+            let chars = ['A', 'B', 'C'];
+            string.extend(chars);
 
-    let chars = ['A', 'B', 'C'];
-    string.extend(chars);
+            let strs = ["DEF", "GHI", "JK"];
+            string.extend(strs);
 
+            let chars = ['L', 'M', 'N', 'O', 'P'];
+            let chars_ref = chars.iter().collect::<Vec<&char>>();
+            string.extend(chars_ref);
 
-    let strs = ["DEF", "GHI", "JK"];
-    string.extend(strs);
+            let strs = ["QRS", "TUV"];
+            let strings: Vec<String> = strs
+                .iter()
+                .map(|s| context.new_string(s).unwrap())
+                .collect();
+            string.extend(strings);
 
-    let chars = ['L', 'M', 'N', 'O', 'P'];
-    let chars_ref = chars.iter().collect::<Vec<&char>>();
-    string.extend(chars_ref);
+            let strs = ["WXY"];
+            let strings: Vec<std::string::String> = strs.iter().map(|s| s.to_string()).collect();
+            string.extend(strings);
 
-    let strs = ["QRS", "TUV"];
-    let strings: Vec<String> = strs.iter().map(|s| context.new_string(s).unwrap()).collect();
-    string.extend(strings);
+            string.extend(['Z']);
 
-    let strs = ["WXY"];
-    let strings: Vec<std::string::String> = strs.iter().map(|s| s.to_string()).collect();
-    string.extend(strings);
-
-    string.extend(['Z']);
-
-    assert_eq!(string.as_ref(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+            assert_eq!(string.as_ref(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+        })
+        .build_or_open();
 }
-

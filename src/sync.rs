@@ -11,10 +11,10 @@ use crate::error::Error;
 use crate::header::typeid_to_u64;
 
 pub struct Arc<T: ?Sized> {
-    data_id:    u128,
-    rcs_id:     u128,
-    type_id:    u64,
-    _phantom: PhantomData<T>
+    data_id: u128,
+    rcs_id: u128,
+    type_id: u64,
+    _phantom: PhantomData<T>,
 }
 
 // Atomic Reference Counting Reference Counts
@@ -29,9 +29,9 @@ impl<T: ?Sized> Drop for Arc<T> {
     }
 }
 
-impl<T> Arc<T> 
+impl<T> Arc<T>
 where
-    T: 'static
+    T: 'static,
 {
     pub fn new(allocator: &mut dyn Allocator, val: T) -> Result<Arc<T>, Error> {
         let size = mem::size_of::<T>() as _;
@@ -54,12 +54,12 @@ where
             data_id,
             rcs_id,
             type_id: typeid_to_u64(TypeId::of::<T>()),
-            _phantom: PhantomData
+            _phantom: PhantomData,
         })
     }
 }
 
-impl <T: ?Sized> Arc<T> {
+impl<T: ?Sized> Arc<T> {
     pub fn downgrade(this: &Arc<T>) -> Result<Weak<T>, Error> {
         unsafe {
             this.increment_weak_count()?;
@@ -67,84 +67,64 @@ impl <T: ?Sized> Arc<T> {
         }
     }
 
-
     pub unsafe fn increment_strong_count(&mut self) -> Result<(), Error> {
         unsafe { self.increment_strong_count_backend() }
     }
 
     unsafe fn increment_strong_count_backend(&self) -> Result<(), Error> {
-        match alloc::map_id(&self.rcs_id) {
-            Some(raw) => {
-                let rcs = unsafe {&mut *(raw as *mut ArcReferenceCounts)};
-                rcs.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            },
-            None => Err(Error::BlockNotFound { allocation_id: self.rcs_id })
-        }
+        let raw = alloc::map_id(&self.rcs_id)?;
+        let rcs = unsafe { &mut *(raw as *mut ArcReferenceCounts) };
+        rcs.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     unsafe fn increment_weak_count(&self) -> Result<(), Error> {
-        match alloc::map_id(&self.rcs_id) {
-            Some(raw) => {
-                let rcs = unsafe {&mut *(raw as *mut ArcReferenceCounts)};
-                rcs.weaks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            },
-            None => Err(Error::BlockNotFound { allocation_id: self.rcs_id })
-        }
+        let raw = alloc::map_id(&self.rcs_id)?;
+        let rcs = unsafe { &mut *(raw as *mut ArcReferenceCounts) };
+        rcs.weaks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     pub unsafe fn decrement_strong_count(&mut self) -> Result<(), Error> {
-        match alloc::map_id(&self.rcs_id) {
-            Some(raw) => {
-                let rcs = unsafe {&mut *(raw as *mut ArcReferenceCounts)};
-                let prev = rcs.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let raw = alloc::map_id(&self.rcs_id)?;
+        let rcs = unsafe { &mut *(raw as *mut ArcReferenceCounts) };
+        let prev = rcs.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 
-                if prev <= 1 {
-                    // Deallocate the data block
-                    alloc::free(&self.data_id);
-                    self.data_id = 0_u128;
-                    if rcs.weaks.load(std::sync::atomic::Ordering::Acquire) <= 0 {
-                        // Deallocate the reference block
-                        alloc::free(&self.rcs_id);
-                        self.rcs_id = 0_u128;
-                    }
-                }
-
-                Ok(())
-            },
-            None => Err(Error::BlockNotFound { allocation_id: self.rcs_id })
+        if prev <= 1 {
+            // Deallocate the data block
+            alloc::free(&self.data_id);
+            self.data_id = 0_u128;
+            if rcs.weaks.load(std::sync::atomic::Ordering::Acquire) <= 0 {
+                // Deallocate the reference block
+                alloc::free(&self.rcs_id);
+                self.rcs_id = 0_u128;
+            }
         }
-    }
 
+        Ok(())
+    }
 }
 
 impl<T: Debug> Debug for Arc<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match alloc::map_id(&self.data_id) {
-            Some(ptr) => unsafe {
-                T::fmt(&*(ptr as *mut T), f)
-            }
-            None => write!(f, "mercy::sync::Arc: ERROR. Data Block not found!")
-        }
+        let raw = alloc::map_id(&self.data_id).unwrap();
+        unsafe { T::fmt(&*(raw as *mut T), f) }
     }
 }
 
 impl<T: Display> Display for Arc<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match alloc::map_id(&self.data_id) {
-            Some(ptr) => unsafe {
-                T::fmt(&*(ptr as *mut T), f)
-            }
-            None => write!(f, "mercy::sync::Arc: ERROR. Data Block not found!")
-        }
+        let raw = alloc::map_id(&self.data_id).unwrap();
+        unsafe { T::fmt(&*(raw as *mut T), f) }
     }
 }
 
 impl<T> Clone for Arc<T> {
     fn clone(&self) -> Self {
         // Update the reference count
-        unsafe { self.increment_strong_count_backend().unwrap(); }
+        unsafe {
+            self.increment_strong_count_backend().unwrap();
+        }
 
         Arc {
             data_id: self.data_id,
@@ -157,8 +137,8 @@ impl<T> Clone for Arc<T> {
     fn clone_from(&mut self, source: &Self) {
         unsafe {
             match self.decrement_strong_count() {
-                Ok (_) => {},
-                Err(Error::BlockNotFound { allocation_id: _ }) => {},
+                Ok(_) => {}
+                Err(Error::BlockNotFound { allocation_id: _ }) => {}
                 Err(e) => panic!("{:?}", e),
             }
         }
@@ -168,7 +148,9 @@ impl<T> Clone for Arc<T> {
         self.type_id = source.type_id;
 
         // Update the reference count
-        unsafe { self.increment_strong_count_backend().unwrap(); }
+        unsafe {
+            self.increment_strong_count_backend().unwrap();
+        }
     }
 }
 
@@ -186,7 +168,6 @@ impl<T> Deref for Arc<T> {
         self.as_ref()
     }
 }
-
 
 impl<T> Arc<T>
 where
@@ -210,7 +191,6 @@ where
     }
 }
 
-
 impl<T> From<Arc<T>> for Arc<dyn Any + Send + Sync>
 where
     T: Any + Send + Sync + 'static,
@@ -227,10 +207,10 @@ where
 }
 
 pub struct Weak<T: ?Sized> {
-    _data_id:    u128,
-    rcs_id:     u128,
-    _type_id:    u64,
-    _phantom: PhantomData<T>
+    _data_id: u128,
+    rcs_id: u128,
+    _type_id: u64,
+    _phantom: PhantomData<T>,
 }
 
 impl<T: ?Sized> Drop for Weak<T> {
@@ -241,7 +221,7 @@ impl<T: ?Sized> Drop for Weak<T> {
 
 impl<T: ?Sized> Weak<T> {
     fn _new() -> Weak<T> {
-        Weak{
+        Weak {
             _phantom: PhantomData,
             _data_id: 0,
             _type_id: 0,
@@ -249,64 +229,48 @@ impl<T: ?Sized> Weak<T> {
         }
     }
 
-    pub fn upgrade(&self) -> Option<Arc<T>> {
-        match alloc::map_id(&self.rcs_id) {
-            Some(rcs_ptr) => {
-                let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
-                let count = rcs.count.load(std::sync::atomic::Ordering::Acquire);
+    pub fn upgrade(&self) -> Result<Arc<T>, Error> {
+        let rcs_ptr = alloc::map_id(&self.rcs_id)?;
+        let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
+        let count = rcs.count.load(std::sync::atomic::Ordering::Acquire);
 
-                if count != 0 {
-                    rcs.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    return unsafe { Some(mem::transmute_copy(self)) };
-
-                } else {
-                    return None
-                }
-            }
-            None => return None,
+        if count != 0 {
+            rcs.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return unsafe { Ok(mem::transmute_copy(self)) };
+        } else {
+            return Err(Error::BlockNotFound {
+                allocation_id: self.rcs_id,
+            });
         }
     }
 
     pub fn strong_count(&self) -> u32 {
-        match alloc::map_id(&self.rcs_id) {
-            Some(rcs_ptr) => {
-                let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
-                rcs.count.load(std::sync::atomic::Ordering::Acquire)
-            }
-            None => return 0,
-        }
+        let rcs_ptr = alloc::map_id(&self.rcs_id).unwrap();
+        let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
+        rcs.count.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn weak_count(&self) -> u32 {
-        match alloc::map_id(&self.rcs_id) {
-            Some(rcs_ptr) => {
-                let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
-                rcs.weaks.load(std::sync::atomic::Ordering::Acquire)
-            }
-            None => return 0,
-        }
+        let rcs_ptr = alloc::map_id(&self.rcs_id).unwrap();
+        let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
+        rcs.weaks.load(std::sync::atomic::Ordering::Acquire)
     }
 
     unsafe fn decrement_weak_count(&mut self) -> Result<(), Error> {
-        match alloc::map_id(&self.rcs_id) {
-            Some(raw) => {
-                let rcs = unsafe {&mut *(raw as *mut ArcReferenceCounts)};
-                let prev = rcs.weaks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let raw = alloc::map_id(&self.rcs_id)?;
+        let rcs = unsafe { &mut *(raw as *mut ArcReferenceCounts) };
+        let prev = rcs.weaks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 
-                if prev <= 1 {
-                    // Check the strong count
-                    let strong = rcs.count.load(std::sync::atomic::Ordering::Acquire);
-                    if strong == 0 {
-                        // Destroy the RCS 
-                        alloc::free(&self.rcs_id);
-                        self.rcs_id = 0_u128;
-                    }
-                }
-
-                Ok(())
-            },
-            None => Err(Error::BlockNotFound { allocation_id: self.rcs_id })
+        if prev <= 1 {
+            // Check the strong count
+            let strong = rcs.count.load(std::sync::atomic::Ordering::Acquire);
+            if strong == 0 {
+                // Destroy the RCS
+                alloc::free(&self.rcs_id);
+                self.rcs_id = 0_u128;
+            }
         }
+
+        Ok(())
     }
 }
-

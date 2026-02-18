@@ -1,13 +1,25 @@
 use core::time;
-use std::{collections::{HashMap, LinkedList}, marker::PhantomData, ops::{Deref, DerefMut}, slice, sync::{atomic::AtomicBool, mpsc::{self, Receiver, Sender}, Arc, LazyLock, Mutex, Weak}, time::{Duration, SystemTime}};
+use std::{
+    collections::{HashMap, LinkedList},
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    slice,
+    sync::{
+        Arc, LazyLock, Mutex, Weak,
+        atomic::AtomicBool,
+        mpsc::{self, Receiver, Sender},
+    },
+    time::{Duration, SystemTime},
+};
 
-use crate::{alloc::{self}, error::Error};
+use crate::{
+    alloc::{self},
+    error::Error,
+};
 
 use similar::DiffOp;
 
-static PROCESS_RECORDER: LazyLock<Mutex<WeakRecorder>> = LazyLock::new(|| {
-    Mutex::new(Weak::new())
-});
+static PROCESS_RECORDER: LazyLock<Mutex<WeakRecorder>> = LazyLock::new(|| Mutex::new(Weak::new()));
 
 const SLEEP_DURATION: Duration = time::Duration::from_secs(0);
 
@@ -17,13 +29,13 @@ pub struct RecorderInner {
     updates: HashMap<u128, LinkedList<Update>>,
     recording: AtomicBool,
     queue_thread: Option<std::thread::JoinHandle<()>>,
-    queue_sender: Sender<SmartRef<u8>>,
-    queue_receiver: Receiver<SmartRef<u8>>,
+    queue_sender: Sender<State<u8>>,
+    queue_receiver: Receiver<State<u8>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Recorder {
-    inner: Arc<Mutex<RecorderInner>>
+    inner: Arc<Mutex<RecorderInner>>,
 }
 
 type WeakRecorder = std::sync::Weak<std::sync::Mutex<RecorderInner>>;
@@ -49,7 +61,7 @@ impl Recorder {
             Some(r) => Ok(Recorder { inner: r }),
             None => {
                 let rec = Recorder {
-                    inner: Arc::new(Mutex::new(RecorderInner::default()))
+                    inner: Arc::new(Mutex::new(RecorderInner::default())),
                 };
                 *lock = Arc::downgrade(&rec.inner);
                 Ok(rec)
@@ -79,13 +91,16 @@ impl Recorder {
 
     pub fn end_recording(&mut self) {
         let mut lock = self.inner.lock().unwrap();
-        lock.recording.store(false, std::sync::atomic::Ordering::Relaxed); // i THINK relaxed is fine...
+        lock.recording
+            .store(false, std::sync::atomic::Ordering::Relaxed); // i THINK relaxed is fine...
 
         let thread = std::mem::replace(&mut lock.queue_thread, None);
         std::mem::drop(lock);
 
         match thread {
-            Some(res) => { let _ = res.join(); },
+            Some(res) => {
+                let _ = res.join();
+            }
             None => {}
         }
 
@@ -96,7 +111,7 @@ impl Recorder {
 
 fn process_queue(recorder: Recorder) {
     // Extract the receiver outside the lock scope to avoid borrow conflicts
-    let rs: Vec<SmartRef<u8>> = {
+    let rs: Vec<State<u8>> = {
         let lock = recorder.inner.lock().unwrap();
         lock.queue_receiver.try_iter().collect()
     };
@@ -108,7 +123,7 @@ fn process_queue(recorder: Recorder) {
     std::thread::sleep(SLEEP_DURATION);
 }
 
-fn process_reference(recorder: Recorder, r: SmartRef<u8>) {
+fn process_reference(recorder: Recorder, r: State<u8>) {
     if let Some(modified_data) = r.modified_data.clone() {
         let update = Update::new(r.alloc_id, &r.original_data, &modified_data);
 
@@ -132,13 +147,16 @@ pub struct Update {
 impl Update {
     pub fn new(alloc_id: u128, original: &[u8], modified: &[u8]) -> Update {
         let changes = similar::capture_diff_slices(similar::Algorithm::Myers, original, modified);
-        Update { update_time: SystemTime::now(), alloc_id, changes }
+        Update {
+            update_time: SystemTime::now(),
+            alloc_id,
+            changes,
+        }
     }
 }
 
-
 #[derive(Clone)]
-pub struct SmartRef<T> {
+pub struct State<T> {
     _phantom: PhantomData<T>,
     alloc_id: u128,
     ptr: usize,
@@ -147,17 +165,19 @@ pub struct SmartRef<T> {
     modified_data: Option<Vec<u8>>,
 }
 
-impl<T> Drop for SmartRef<T> {
+impl<T> Drop for State<T> {
     fn drop(&mut self) {
         // Tell the recorder to record whatever the fuck
         if let Some(recorder) = PROCESS_RECORDER.lock().unwrap().upgrade() {
             // Get the ptr to the data
             let data = match &self.modified_data {
-                Some(_) => unsafe { Some(slice::from_raw_parts(self.ptr as *const u8, self.len).to_vec()) },
-                None => None
+                Some(_) => unsafe {
+                    Some(slice::from_raw_parts(self.ptr as *const u8, self.len).to_vec())
+                },
+                None => None,
             };
 
-            let clone = SmartRef {
+            let clone = State {
                 _phantom: PhantomData,
                 alloc_id: self.alloc_id,
                 ptr: self.ptr,
@@ -170,17 +190,17 @@ impl<T> Drop for SmartRef<T> {
     }
 }
 
-impl<T> SmartRef<T> {
-    pub fn new(alloc_id: u128) -> Result<SmartRef<T>, Error> {
+impl<T> State<T> {
+    pub fn new(alloc_id: u128) -> Result<State<T>, Error> {
         // Get the ptr to the data
-        let ptr = alloc::map_id(&alloc_id).ok_or(Error::BlockNotFound { allocation_id: alloc_id })?;
-        let len = alloc::len(&alloc_id)? as _;
+        let ptr = alloc::map_id(&alloc_id)? as *const u8;
+        let len = alloc::len(&alloc_id)? as usize;
 
         let data = unsafe { slice::from_raw_parts(ptr, len).to_vec() };
 
-        Ok(SmartRef {
+        Ok(State {
             _phantom: PhantomData,
-            alloc_id: alloc_id,
+            alloc_id,
             ptr: ptr as usize,
             original_data: data,
             modified_data: None,
@@ -189,63 +209,61 @@ impl<T> SmartRef<T> {
     }
 }
 
-impl<T> AsRef<T> for SmartRef<T> {
+impl<T> AsRef<T> for State<T> {
     fn as_ref(&self) -> &T {
         unsafe { &*(self.ptr as *const T) }
     }
 }
 
-impl<T> AsMut<T> for SmartRef<T> {
+impl<T> AsMut<T> for State<T> {
     fn as_mut(&mut self) -> &mut T {
         self.modified_data = Some(Vec::new());
         unsafe { &mut *(self.ptr as *mut T) }
     }
 }
 
-impl<T> Deref for SmartRef<T> {
+impl<T> Deref for State<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         self.as_ref()
     }
 }
 
-impl<T> DerefMut for SmartRef<T> {
+impl<T> DerefMut for State<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut()
     }
 }
 
-
 #[test]
 fn the_first_recording_test() {
-    use crate::context::ContextBuilder;
     use crate::alloc::AllocatesTypes;
+    use crate::context::ContextBuilder;
 
     let id = String::from("crayon.mercy.test.rec");
-    let mut context = ContextBuilder::new(&id).build_or_open().unwrap();
+    ContextBuilder::new(&id)
+        .main(|res| {
+            let mut context = res.unwrap();
+            let mut recording = Recorder::new().unwrap();
+            recording.begin_recording();
 
-    let mut recording = Recorder::new().unwrap();
-    recording.begin_recording();
+            let b = context.new_box(0x99).unwrap();
 
+            {
+                let mut r = b.map().unwrap();
+                *r = 0x1;
+            }
+            {
+                let mut r = b.map().unwrap();
+                *r = 0x2;
+            }
+            {
+                let mut r = b.map().unwrap();
+                *r = 0x0;
+            }
+            recording.end_recording();
 
-    let b = context.new_box(0x99).unwrap();
-
-    {
-        let mut r = b.map().unwrap();
-        *r = 0x1;
-    }
-    {
-        let mut r = b.map().unwrap();
-        *r = 0x2;
-    }
-    {
-        let mut r = b.map().unwrap();
-        *r = 0x0;
-    }
-    recording.end_recording();
-
-    println!("RECORDED DATA: {:?}", recording);
+            println!("RECORDED DATA: {:?}", recording);
+        })
+        .build_or_open();
 }
-
-
-

@@ -1,11 +1,11 @@
-use crate::error::Error;
 use super::context;
+use crate::error::Error;
 
 pub trait Allocator {
     fn alloc(&mut self, size: u32) -> Result<u128, Error>;
     fn free(&mut self, id: u128);
 
-    fn map_id(&mut self, id: u128) -> Option<*mut u8>;
+    fn map_id(&mut self, id: u128) -> Result<*mut u8, Error>;
 }
 
 pub trait AllocatesTypes: Allocator + Sized {
@@ -13,7 +13,7 @@ pub trait AllocatesTypes: Allocator + Sized {
         crate::boxed::Box::new(self, val)
     }
 
-    fn new_arc<T: 'static>(&mut self, val:T) -> Result<super::sync::Arc<T>, Error> {
+    fn new_arc<T: 'static>(&mut self, val: T) -> Result<super::sync::Arc<T>, Error> {
         crate::sync::Arc::new(self, val)
     }
 
@@ -22,10 +22,7 @@ pub trait AllocatesTypes: Allocator + Sized {
     }
 }
 
-impl<T> AllocatesTypes for T
-where 
-    T: Allocator
-{}
+impl<T> AllocatesTypes for T where T: Allocator {}
 
 pub fn free(id: &u128) {
     let implementation = *id as u16;
@@ -36,7 +33,9 @@ pub fn free(id: &u128) {
 
             let mut context = match context::check_registered_contexts(context_id) {
                 Some(context) => context,
-                None => { return; }
+                None => {
+                    return;
+                }
             };
 
             context.free(*id);
@@ -45,11 +44,11 @@ pub fn free(id: &u128) {
     }
 }
 
-pub fn map_id(id: &u128) -> Option<*mut u8> {
+pub fn map_id(id: &u128) -> Result<*mut u8, Error> {
     let implementation = *id as u16;
 
     if id.eq(&0_u128) {
-        return None;
+        return Err(Error::BlockNotFound { allocation_id: *id });
     }
 
     match implementation {
@@ -59,14 +58,12 @@ pub fn map_id(id: &u128) -> Option<*mut u8> {
 
             let mut context = match context::check_registered_contexts(context_id) {
                 Some(context) => context,
-                None => { return None }
+                None => return Err(Error::RequestedContextNotFound { id: *id }),
             };
 
             context.map_id(*id)
         }
-        _ => {
-            None
-        }
+        _ => Err(Error::OperationUnsupported),
     }
 }
 
@@ -74,7 +71,9 @@ pub fn len(alloc_id: &u128) -> Result<u32, Error> {
     let implementation = *alloc_id as u16;
 
     if alloc_id.eq(&0_128) {
-        return Err(Error::BlockNotFound { allocation_id: *alloc_id })
+        return Err(Error::BlockNotFound {
+            allocation_id: *alloc_id,
+        });
     }
 
     match implementation {
@@ -86,11 +85,8 @@ pub fn len(alloc_id: &u128) -> Result<u32, Error> {
                 Err(Error::RequestedAllocInfoNotFound { id: *alloc_id })
             }
         }
-        _ => {
-            Err(Error::RequestedAllocInfoNotFound { id: *alloc_id })
-        }
+        _ => Err(Error::RequestedAllocInfoNotFound { id: *alloc_id }),
     }
-
 }
 
 // Not doing documentaion right now.. this doesnt free anything, it just allocates a new
@@ -112,15 +108,13 @@ pub fn realloc(id: &u128, size: u32) -> Result<u128, Error> {
 
             context.alloc(size)
         }
-        _ => {
-            Err(Error::OperationUnsupported)
-        }
+        _ => Err(Error::OperationUnsupported),
     }
 }
 
 #[test]
 fn the_realloc_test() {
-    use crate::alloc::{Allocator, realloc, free};
+    use crate::alloc::{Allocator, free, realloc};
     use crate::context::ContextBuilder;
 
     // Create a new context
@@ -128,24 +122,25 @@ fn the_realloc_test() {
 
     println!("Creating context with id: {}", id);
     tracing::debug!("Creating context with id: {}", id);
-    let mut context = ContextBuilder::new(&id)
-        .build_or_open()
-        .unwrap();
-    println!("Context created successfully: {:?}", context);
+    ContextBuilder::new(&id)
+        .main(|res| {
+            let mut context = res.unwrap();
 
-    // Allocate a buffer
-    let one = context.alloc(64).unwrap();
-    let two = realloc(&one, 64).unwrap();
+            // Allocate a buffer
+            let one = context.alloc(64).unwrap();
+            let two = realloc(&one, 64).unwrap();
 
-    // Should be the same context
-    assert_eq!((one >> 64) as u64, (two >> 64) as u64);
-    // Should be the same size
-    assert_eq!((one >> 32) as u32, (two >> 32) as u32);
-    // Should different alloc ids
-    assert_ne!((one >> 16) as u16, (two >> 16) as u16);
-    // Should be the same implementation
-    assert_eq!(one as u16, two as u16);
+            // Should be the same context
+            assert_eq!((one >> 64) as u64, (two >> 64) as u64);
+            // Should be the same size
+            assert_eq!((one >> 32) as u32, (two >> 32) as u32);
+            // Should different alloc ids
+            assert_ne!((one >> 16) as u16, (two >> 16) as u16);
+            // Should be the same implementation
+            assert_eq!(one as u16, two as u16);
 
-    free(&one);
-    free(&two);
+            free(&one);
+            free(&two);
+        })
+        .build_or_open();
 }

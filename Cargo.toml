@@ -3,10 +3,24 @@ name = "mercy"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+proc-macro = true
+
 [dependencies]
+derivative = "2.2.0"
 errno = "0.3.12"
 libc = "0.2.173"
 nix = "0.30.1"
 num-traits = "0.2.19"
+proc-macro2 = "1.0.106"
+rand = "0.10.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_bytes = "0.11"
 similar = "2.7.0"
+syn = { version = "2.0.116", features = ["full"] }
 tracing = "0.1.41"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block = "0.1"
+xpc-sys = "1.0.0"
+
