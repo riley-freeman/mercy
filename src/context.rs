@@ -126,12 +126,12 @@ pub struct ContextInner {
 
 impl ContextInner {
     fn new(id: &str) -> Result<Context, error::Error> {
-        #[cfg(target_os = "macos")]
-        let dispatch = std::boxed::Box::new(AppleContext::new(id));
-        #[cfg(target_os = "ios")]
-        let dispatch = std::boxed::Box::new(AppleContext::new(id));
-
         let id_hash = hash_id(id);
+
+        #[cfg(target_os = "macos")]
+        let dispatch = std::boxed::Box::new(AppleContext::new(id_hash));
+        #[cfg(target_os = "ios")]
+        let dispatch = std::boxed::Box::new(AppleContext::new(id_hash));
         let header_id = 0; // TODO: Source this correctly
 
         let context_inner = ContextInner {
@@ -157,12 +157,12 @@ impl ContextInner {
     }
 
     fn open(id: &str, _take_ownership: bool) -> Result<Context, error::Error> {
-        #[cfg(target_os = "macos")]
-        let dispatch = Box::new(AppleContext::new(id));
-        #[cfg(target_os = "ios")]
-        let dispatch = Box::new(AppleContext::new(id));
-
         let id_hash = hash_id(id);
+
+        #[cfg(target_os = "macos")]
+        let dispatch = Box::new(AppleContext::new(id_hash));
+        #[cfg(target_os = "ios")]
+        let dispatch = Box::new(AppleContext::new(id_hash));
         let header_id = 0; // TODO: Source this correctly
 
         let context_inner = ContextInner {

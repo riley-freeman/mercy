@@ -7,7 +7,7 @@ use std::{
 use libc::strlen;
 
 use crate::{
-    alloc::{self, Allocator},
+    alloc::{self, Allocator, HasAllocId},
     error::Error,
 };
 
@@ -24,7 +24,9 @@ impl Drop for String {
 impl String {
     pub fn new(allocator: &mut dyn Allocator, value: &str) -> Result<Self, Error> {
         let len = value.len();
+        println!("Allocating string of length: {}", len);
         let id = allocator.alloc(len as u32 + 1)?;
+        println!("Allocated string of length: {}", len);
 
         // Write the (only byte) data into the buffer
         let ptr = allocator.map_id(id)?;
@@ -33,6 +35,8 @@ impl String {
             libc::memcpy(ptr as _, value.as_ptr() as _, len);
             libc::memcpy(ptr.byte_add(len) as _, &0 as *const _ as _, 1);
         }
+        println!("Setting string with contents: {}", value);
+
 
         Ok(String { id })
     }
@@ -77,6 +81,13 @@ impl String {
         unsafe { libc::memcpy(new_ptr as _, ptr as _, len) };
 
         Ok(Self { id: new_id })
+    }
+}
+
+impl HasAllocId for String {
+    type Inner = String;
+    fn alloc_id(&self) -> u128 {
+        self.id
     }
 }
 

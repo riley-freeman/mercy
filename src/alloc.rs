@@ -8,6 +8,11 @@ pub trait Allocator {
     fn map_id(&mut self, id: u128) -> Result<*mut u8, Error>;
 }
 
+pub trait HasAllocId {
+    type Inner;
+    fn alloc_id(&self) -> u128;
+}
+
 pub trait AllocatesTypes: Allocator + Sized {
     fn new_box<T>(&mut self, val: T) -> Result<super::boxed::Box<T>, Error> {
         crate::boxed::Box::new(self, val)
@@ -46,6 +51,7 @@ pub fn free(id: &u128) {
 
 pub fn map_id(id: &u128) -> Result<*mut u8, Error> {
     let implementation = *id as u16;
+    println!("[DEBUG] [map_id] implementation: {}", implementation);
 
     if id.eq(&0_u128) {
         return Err(Error::BlockNotFound { allocation_id: *id });
@@ -69,6 +75,7 @@ pub fn map_id(id: &u128) -> Result<*mut u8, Error> {
 
 pub fn len(alloc_id: &u128) -> Result<u32, Error> {
     let implementation = *alloc_id as u16;
+    println!("[DEBUG] implementation: {}", implementation);
 
     if alloc_id.eq(&0_128) {
         return Err(Error::BlockNotFound {
@@ -94,6 +101,7 @@ pub fn len(alloc_id: &u128) -> Result<u32, Error> {
 // If you have no idea what i'm talmbout fr ong.
 pub fn realloc(id: &u128, size: u32) -> Result<u128, Error> {
     let implementation = *id as u16;
+    println!("[DEBUG] [realloc] implementation: {}", implementation);
 
     if id.eq(&0_u128) {
         return Err(Error::OperationUnsupported);

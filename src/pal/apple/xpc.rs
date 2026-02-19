@@ -3,21 +3,21 @@ use std::fmt;
 use std::os::raw::c_void;
 use std::ptr::{null, null_mut};
 
-use serde::{de, de::IntoDeserializer, ser, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de, de::IntoDeserializer, ser};
 use xpc_sys::{
     _xpc_type_array, _xpc_type_bool, _xpc_type_data, _xpc_type_dictionary, _xpc_type_double,
-    _xpc_type_int64, _xpc_type_null, _xpc_type_string, _xpc_type_uint64,
-    xpc_array_append_value, xpc_array_create, xpc_array_get_count, xpc_array_get_value,
-    xpc_bool_create, xpc_bool_get_value, xpc_copy, xpc_copy_description, xpc_data_create,
-    xpc_data_get_bytes_ptr, xpc_data_get_length, xpc_dictionary_create, xpc_dictionary_set_value,
-    xpc_double_create, xpc_double_get_value, xpc_get_type, xpc_int64_create, xpc_int64_get_value,
-    xpc_null_create, xpc_object_t, xpc_release, xpc_retain, xpc_string_create,
-    xpc_string_get_string_ptr, xpc_uint64_create, xpc_uint64_get_value,
+    _xpc_type_int64, _xpc_type_null, _xpc_type_string, _xpc_type_uint64, xpc_array_append_value,
+    xpc_array_create, xpc_array_get_count, xpc_array_get_value, xpc_bool_create,
+    xpc_bool_get_value, xpc_copy_description, xpc_data_create, xpc_data_get_bytes_ptr,
+    xpc_data_get_length, xpc_dictionary_create, xpc_dictionary_set_value, xpc_double_create,
+    xpc_double_get_value, xpc_get_type, xpc_int64_create, xpc_int64_get_value, xpc_null_create,
+    xpc_object_t, xpc_release, xpc_retain, xpc_string_create, xpc_string_get_string_ptr,
+    xpc_uint64_create, xpc_uint64_get_value,
 };
 
 // We need xpc_dictionary_apply and xpc_dictionary_get_value for deserialization.
 // These are available through the bindgen-generated bindings in xpc_sys.
-use xpc_sys::{xpc_dictionary_get_value};
+use xpc_sys::xpc_dictionary_get_value;
 
 // ──────────────────────────────────────────────
 // AppleObject
@@ -69,7 +69,7 @@ impl Clone for AppleObject {
     fn clone(&self) -> Self {
         unsafe {
             Self {
-                ptr: xpc_copy(self.ptr),
+                ptr: xpc_retain(self.ptr),
             }
         }
     }
@@ -192,9 +192,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<AppleObject, Error> {
-        Ok(unsafe {
-            AppleObject::from_raw(xpc_data_create(v.as_ptr() as *const c_void, v.len()))
-        })
+        Ok(unsafe { AppleObject::from_raw(xpc_data_create(v.as_ptr() as *const c_void, v.len())) })
     }
 
     fn serialize_none(self) -> Result<AppleObject, Error> {
@@ -282,11 +280,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         })
     }
 
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        _len: usize,
-    ) -> Result<MapSerializer, Error> {
+    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<MapSerializer, Error> {
         self.serialize_map(Some(_len))
     }
 
@@ -736,7 +730,9 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer {
             }
         }
 
-        Err(Error::Message("expected string or single-key dictionary for enum".into()))
+        Err(Error::Message(
+            "expected string or single-key dictionary for enum".into(),
+        ))
     }
 
     fn deserialize_identifier<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
@@ -744,7 +740,18 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer {
     }
 
     fn deserialize_ignored_any<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        self.deserialize_any(visitor)
+        if self.obj.is_null() || xpc_type_eq!(self.obj, _xpc_type_null) {
+            return visitor.visit_unit();
+        }
+        // Recurse into compound types so nested unknown values are also skipped.
+        if xpc_type_eq!(self.obj, _xpc_type_array) {
+            return visitor.visit_seq(XpcSeqAccess::new(self.obj));
+        }
+        if xpc_type_eq!(self.obj, _xpc_type_dictionary) {
+            return visitor.visit_map(XpcMapAccess::new(self.obj));
+        }
+        // For all scalar types (known or unknown like xpc_shmem), just skip.
+        visitor.visit_unit()
     }
 }
 
@@ -882,10 +889,7 @@ impl<'de> de::MapAccess<'de> for XpcMapAccess {
         Ok(Some(result))
     }
 
-    fn next_value_seed<V: de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: V,
-    ) -> Result<V::Value, Error> {
+    fn next_value_seed<V: de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
         let key_str = &self.keys[self.index];
         self.index += 1;
         let ckey = CString::new(key_str.as_str()).map_err(|e| Error::Message(e.to_string()))?;
@@ -917,7 +921,8 @@ impl<'de> de::EnumAccess<'de> for XpcEnumAccess {
             self.variant.clone().into_deserializer();
         let val = seed.deserialize(variant_de)?;
 
-        let ckey = CString::new(self.variant.as_str()).map_err(|e| Error::Message(e.to_string()))?;
+        let ckey =
+            CString::new(self.variant.as_str()).map_err(|e| Error::Message(e.to_string()))?;
         let inner = unsafe { xpc_dictionary_get_value(self.dict, ckey.as_ptr()) };
 
         Ok((val, XpcVariantAccess { inner }))
@@ -935,15 +940,16 @@ impl<'de> de::VariantAccess<'de> for XpcVariantAccess {
         Ok(())
     }
 
-    fn newtype_variant_seed<T: de::DeserializeSeed<'de>>(
-        self,
-        seed: T,
-    ) -> Result<T::Value, Error> {
+    fn newtype_variant_seed<T: de::DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
         let mut de = Deserializer::from_raw(self.inner);
         seed.deserialize(&mut de)
     }
 
-    fn tuple_variant<V: de::Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
+    fn tuple_variant<V: de::Visitor<'de>>(
+        self,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
         if xpc_type_eq!(self.inner, _xpc_type_array) {
             visitor.visit_seq(XpcSeqAccess::new(self.inner))
         } else {
@@ -959,7 +965,9 @@ impl<'de> de::VariantAccess<'de> for XpcVariantAccess {
         if xpc_type_eq!(self.inner, _xpc_type_dictionary) {
             visitor.visit_map(XpcMapAccess::new(self.inner))
         } else {
-            Err(Error::Message("expected dictionary for struct variant".into()))
+            Err(Error::Message(
+                "expected dictionary for struct variant".into(),
+            ))
         }
     }
 }

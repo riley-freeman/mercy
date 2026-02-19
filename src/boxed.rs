@@ -1,7 +1,6 @@
 use crate::{
-    alloc::{self, Allocator},
+    alloc::{self, Allocator, HasAllocId},
     error::Error,
-    rec::State,
 };
 use std::{
     fmt::{Debug, Display},
@@ -34,9 +33,27 @@ impl<T> Box<T> {
             _phantom: PhantomData,
         })
     }
+}
 
-    pub fn map(&self) -> Option<State<T>> {
-        State::new(self.id).ok()
+impl<T> HasAllocId for Box<T> {
+    type Inner = T;
+    fn alloc_id(&self) -> u128 {
+        self.id
+    }
+}
+
+impl<T: Clone> Clone for Box<T> {
+    fn clone(&self) -> Self {
+        let new_id = alloc::realloc(&self.id, mem::size_of::<T>() as _).unwrap();
+        let new_ref: *mut T = unsafe { &mut *(alloc::map_id(&new_id).unwrap() as *mut T) };
+
+        let old_ref = unsafe { &*(alloc::map_id(&self.id).unwrap() as *const T) };
+        unsafe { *new_ref = old_ref.clone() };
+
+        Box::<T> {
+            id: new_id,
+            _phantom: PhantomData,
+        }
     }
 }
 

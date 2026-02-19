@@ -121,8 +121,9 @@ mod tests {
                     dead: false, // Not yet.
                 };
 
-                let in_box = context.new_box(mark_sadiki.clone()).unwrap();
-                assert_eq!(mark_sadiki, Person::clone(&in_box.map().unwrap()));
+                let in_box =
+                    crate::rec::State::new(context.new_box(mark_sadiki.clone()).unwrap()).unwrap();
+                assert_eq!(mark_sadiki, Person::clone(&in_box.watch().unwrap()));
             })
             .build_or_open();
     }

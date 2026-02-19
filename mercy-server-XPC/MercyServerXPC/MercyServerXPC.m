@@ -10,28 +10,19 @@
 typedef struct {
     void *ptr;
     size_t size;
-    xpc_object_t shmem; // lazily created on MapId
 } Allocation;
 
 static NSMutableDictionary<NSNumber *, NSValue *> *allocations;
-static NSInteger nextAllocId = 1;
+static NSInteger nextBlockId = 1;
 
 // ──────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────
 
-/// Encode an NSInteger allocation key into a 16-byte alloc_id (native endian, zero-padded).
-static void encode_alloc_id(NSInteger key, uint8_t out[16]) {
-    memset(out, 0, 16);
-    memcpy(out, &key, sizeof(NSInteger));
-}
-
-/// Decode a 16-byte alloc_id back to an NSInteger key.
-static NSInteger decode_alloc_id(const uint8_t *bytes, size_t len) {
-    NSInteger key = 0;
-    size_t copyLen = (len < sizeof(NSInteger)) ? len : sizeof(NSInteger);
-    memcpy(&key, bytes, copyLen);
-    return key;
+/// Decode a 16-byte alloc_id and return the blockId.
+/// Layout: [implID: u16][blockID: u16][length: u32][contextID: u64]
+static uint16_t decode_alloc_id(uint64_t allocIdLow) {
+    return (uint16_t)(allocIdLow >> 16);
 }
 
 /// Build an XPC reply dictionary with the standard envelope fields.
@@ -43,11 +34,28 @@ static xpc_object_t create_reply_envelope(int64_t originalId, const char *messag
     return reply;
 }
 
+typedef struct {
+    uint64_t high;  // context_id
+    uint64_t low;   // size | block_id | implementation
+} alloc_id_t;
+
+/// Encode an alloc_id into out[16].
+/// Layout: [implID: u16 = 0][blockID: u16][length: u32][contextID: u64]
+static alloc_id_t encode_alloc_id(uint64_t context_id, uint16_t block_id, uint32_t length) {
+    alloc_id_t id;
+    id.high = context_id;
+    id.low  = ((uint64_t)length << 32) |
+        ((uint64_t)block_id << 16) |
+        ((uint64_t)0);
+    return id;
+}
+
 // ──────────────────────────────────────────────
 // Message handlers
 // ──────────────────────────────────────────────
 
 static void handle_alloc(xpc_connection_t conn, int64_t msgId, xpc_object_t data) {
+    int64_t contextId = xpc_dictionary_get_int64(data, "context_id");
     int64_t size = xpc_dictionary_get_int64(data, "size");
     if (size <= 0) return;
 
@@ -57,17 +65,18 @@ static void handle_alloc(xpc_connection_t conn, int64_t msgId, xpc_object_t data
     if (kr != KERN_SUCCESS) return;
 
     // Store the allocation
-    NSInteger allocId = nextAllocId++;
-    Allocation alloc = { .ptr = (void *)address, .size = (size_t)size, .shmem = NULL };
-    allocations[@(allocId)] = [NSValue valueWithBytes:&alloc objCType:@encode(Allocation)];
+    NSInteger blockId = nextBlockId ++;
+    Allocation alloc = { .ptr = (void *)address, .size = (size_t)size };
+    allocations[@(blockId)] = [NSValue valueWithBytes:&alloc objCType:@encode(Allocation)];
 
     // Build and send reply
     xpc_object_t reply = create_reply_envelope(msgId, "Alloc");
     xpc_object_t replyData = xpc_dictionary_create(NULL, NULL, 0);
+    
+    alloc_id_t alloc_id = encode_alloc_id((uint64_t)contextId, (uint16_t)blockId, (uint32_t)size);
 
-    uint8_t allocIdBytes[16];
-    encode_alloc_id(allocId, allocIdBytes);
-    xpc_dictionary_set_data(replyData, "alloc_id", allocIdBytes, 16);
+    xpc_dictionary_set_uint64(replyData, "alloc_id_high", alloc_id.high);
+    xpc_dictionary_set_uint64(replyData, "alloc_id_low", alloc_id.low);
 
     xpc_dictionary_set_value(reply, "message_data", replyData);
     xpc_connection_send_message(conn, reply);
@@ -77,58 +86,47 @@ static void handle_alloc(xpc_connection_t conn, int64_t msgId, xpc_object_t data
 }
 
 static void handle_free(int64_t msgId, xpc_object_t data) {
-    size_t len = 0;
-    const void *allocIdBytes = xpc_dictionary_get_data(data, "alloc_id", &len);
-    if (!allocIdBytes || len == 0) return;
+    alloc_id_t allocId = {
+        xpc_dictionary_get_uint64(data, "alloc_id_high"),
+        xpc_dictionary_get_uint64(data, "alloc_id_low"),
+    };
 
-    NSInteger allocId = decode_alloc_id(allocIdBytes, len);
-    NSValue *val = allocations[@(allocId)];
+    NSInteger blockId = (NSInteger)decode_alloc_id(allocId.low);
+    NSValue *val = allocations[@(blockId)];
     if (!val) return;
 
     Allocation alloc;
     [val getValue:&alloc];
 
-    // Deallocate the memory region
     vm_deallocate(mach_task_self(), (vm_address_t)alloc.ptr, alloc.size);
-
-    // Release the shmem object if it was created
-    if (alloc.shmem) {
-        // xpc_release(alloc.shmem);
-    }
-
-    [allocations removeObjectForKey:@(allocId)];
+    [allocations removeObjectForKey:@(blockId)];
 }
 
 static void handle_map_id(xpc_connection_t conn, int64_t msgId, xpc_object_t data) {
-    size_t len = 0;
-    const void *allocIdBytes = xpc_dictionary_get_data(data, "alloc_id", &len);
-    if (!allocIdBytes || len == 0) return;
-
-    NSInteger allocId = decode_alloc_id(allocIdBytes, len);
-    NSValue *val = allocations[@(allocId)];
+    NSLog(@"[DEBUG] [MERCY SERVER] Sending over a xpc_shmem_object!\n");
+    
+    alloc_id_t allocId = {
+        xpc_dictionary_get_uint64(data, "alloc_id_high"),
+        xpc_dictionary_get_uint64(data, "alloc_id_low"),
+    };
+    NSInteger blockId = (NSInteger)decode_alloc_id(allocId.low);
+    NSValue *val = allocations[@(blockId)];
     if (!val) return;
 
     Allocation alloc;
     [val getValue:&alloc];
 
-    // Lazily create the xpc_shmem object
-    if (!alloc.shmem) {
-        alloc.shmem = xpc_shmem_create(alloc.ptr, alloc.size);
-        // Update the stored allocation with the shmem reference
-        allocations[@(allocId)] = [NSValue valueWithBytes:&alloc objCType:@encode(Allocation)];
-    }
+    xpc_object_t shmem = xpc_shmem_create(alloc.ptr, alloc.size);
+    if (!shmem) return;
 
-    // Build and send reply — package the shmem as a uint64
     xpc_object_t reply = create_reply_envelope(msgId, "MapId");
     xpc_object_t replyData = xpc_dictionary_create(NULL, NULL, 0);
 
-    xpc_dictionary_set_uint64(replyData, "xpc_handle_int", (uint64_t)alloc.shmem);
-
+    xpc_dictionary_set_value(replyData, "xpc_shmem", shmem);
     xpc_dictionary_set_value(reply, "message_data", replyData);
     xpc_connection_send_message(conn, reply);
 
-    // xpc_release(replyData);
-    // xpc_release(reply);
+    NSLog(@"[DEBUG] [MERCY SERVER] Sent over a xpc_shmem_object!\n");
 }
 
 // ──────────────────────────────────────────────
@@ -167,3 +165,4 @@ int mercy_server_xpc_main(int argc, const char *argv[])
     xpc_main(xpc_connection_handler);
     return 0;
 }
+
