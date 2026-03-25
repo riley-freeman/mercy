@@ -10,9 +10,10 @@ use crate::pal::DispatchContext;
 use crate::pal::apple::AppleContext;
 #[cfg(target_os = "ios")]
 use crate::pal::apple::AppleContext;
+#[cfg(target_os = "linux")]
+use crate::pal::posix::PosixContext;
 
 use super::error;
-use super::header::MercyHeader;
 use super::mapping;
 
 static PROCESS_CONTEXTS: LazyLock<std::sync::Mutex<collections::HashMap<usize, WeakContext>>> =
@@ -72,12 +73,17 @@ impl ContextBuilder {
     }
 
     pub fn build(mut self) -> ! {
-        let context = ContextInner::new(&self.id);
-        let job_name = option_env!("CRAYON_MERCY_JOB_NAME").unwrap_or("main");
+        let job_name = std::env::var("CRAYON_MERCY_JOB_NAME").unwrap_or(String::from("main"));
+        if job_name.eq("manager") {
+            #[cfg(target_os = "linux")]
+            crate::pal::posix::server::start_server(&self.id).unwrap();
+            exit(0);
+        }
 
+        let context = ContextInner::new(&self.id);
         let job = self
             .jobs
-            .remove(job_name)
+            .remove(&job_name)
             .expect(&format!("Job {} not found", job_name));
         job(context);
 
@@ -85,12 +91,17 @@ impl ContextBuilder {
     }
 
     pub fn open(mut self) -> ! {
-        let context = ContextInner::open(&self.id, false);
-        let job_name = option_env!("CRAYON_MERCY_JOB_NAME").unwrap_or("main");
+        let job_name = std::env::var("CRAYON_MERCY_JOB_NAME").unwrap_or(String::from("main"));
+        if job_name.eq("manager") {
+            #[cfg(target_os = "linux")]
+            crate::pal::posix::server::start_server(&self.id).unwrap();
+            exit(0);
+        }
 
+        let context = ContextInner::open(&self.id, false);
         let job = self
             .jobs
-            .remove(job_name)
+            .remove(&job_name)
             .expect(&format!("Job {} not found", job_name));
         job(context);
 
@@ -132,6 +143,11 @@ impl ContextInner {
         let dispatch = std::boxed::Box::new(AppleContext::new(id_hash));
         #[cfg(target_os = "ios")]
         let dispatch = std::boxed::Box::new(AppleContext::new(id_hash));
+        #[cfg(target_os = "macos")]
+        let dispatch = std::boxed::Box::new(AppleContext::new(id_hash));
+        #[cfg(target_os = "linux")]
+        let dispatch = std::boxed::Box::new(PosixContext::new(id, id_hash));
+
         let header_id = 0; // TODO: Source this correctly
 
         let context_inner = ContextInner {
@@ -163,6 +179,9 @@ impl ContextInner {
         let dispatch = Box::new(AppleContext::new(id_hash));
         #[cfg(target_os = "ios")]
         let dispatch = Box::new(AppleContext::new(id_hash));
+        #[cfg(target_os = "linux")]
+        let dispatch = std::boxed::Box::new(PosixContext::open(id, id_hash)?);
+
         let header_id = 0; // TODO: Source this correctly
 
         let context_inner = ContextInner {

@@ -24,9 +24,9 @@ impl Drop for String {
 impl String {
     pub fn new(allocator: &mut dyn Allocator, value: &str) -> Result<Self, Error> {
         let len = value.len();
-        println!("Allocating string of length: {}", len);
+        println!("[DEBUG] [string] Allocating string of length: {}", len);
         let id = allocator.alloc(len as u32 + 1)?;
-        println!("Allocated string of length: {}", len);
+        println!("[DEBUG] [string] Allocated string of length: {}", len);
 
         // Write the (only byte) data into the buffer
         let ptr = allocator.map_id(id)?;
@@ -36,7 +36,6 @@ impl String {
             libc::memcpy(ptr.byte_add(len) as _, &0 as *const _ as _, 1);
         }
         println!("Setting string with contents: {}", value);
-
 
         Ok(String { id })
     }

@@ -1,23 +1,56 @@
 #[derive(Debug)]
 pub enum Error {
-    InvalidSize { size: usize },
-    InvalidPermissions { id: String },
+    InvalidSize {
+        size: usize,
+    },
+    InvalidPermissions {
+        id: String,
+    },
 
-    IdAlreadyExists { id: String },
-    RequestedAllocInfoNotFound { id: u128 },
-    RequestedAllocatorNotFound { id: u128 },
-    RequestedContextNotFound { id: u128 },
+    IdAlreadyExists {
+        id: String,
+    },
+    RequestedAllocInfoNotFound {
+        id: u128,
+    },
+    RequestedAllocatorNotFound {
+        id: u128,
+    },
+    RequestedContextNotFound {
+        id: u128,
+    },
 
-    JobNameReserved { name: String },
+    JobNameReserved {
+        name: String,
+    },
 
     OperationUnsupported,
 
     ProcessLimitReached,
 
-    NoBlocksAvailable { requested: usize },
-    BlockNotFound { allocation_id: u128 },
+    NoBlocksAvailable {
+        requested: usize,
+    },
+    BlockNotFound {
+        allocation_id: u128,
+    },
 
-    MiscellaneousOSError { code: i32 },
+    UnexpectedMessageType {
+        message_type: String,
+    },
+
+    IoError {
+        io_error: std::io::Error,
+    },
+
+    #[cfg(target_os = "linux")]
+    ShmemError {
+        shmem_error: shared_memory::ShmemError,
+    },
+
+    MiscellaneousOSError {
+        code: i32,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -54,6 +87,15 @@ impl std::fmt::Display for Error {
                 (allocation_id >> 64) as u64,
                 (allocation_id >> 16) as u16
             ),
+
+            Error::UnexpectedMessageType { message_type } => {
+                write!(f, "Unexpected message type: {}", message_type)
+            }
+
+            Error::IoError { io_error } => write!(f, "IO error: {}", io_error),
+
+            #[cfg(target_os = "linux")]
+            Error::ShmemError { shmem_error } => write!(f, "Shmem error: {}", shmem_error),
 
             Error::MiscellaneousOSError { code } => write!(f, "Miscellaneous OS error: {}", code),
         }

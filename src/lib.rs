@@ -3,6 +3,7 @@ pub mod boxed;
 pub mod context;
 pub mod error;
 pub mod macros;
+pub mod message;
 pub mod rec;
 pub mod string;
 pub mod sync;

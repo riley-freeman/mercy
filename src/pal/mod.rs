@@ -8,4 +8,7 @@ pub mod apple;
 #[cfg(target_os = "ios")]
 pub mod apple;
 
+#[cfg(target_os = "linux")]
+pub mod posix;
+
 pub trait DispatchContext: Debug + Send + Sync + Allocator {}

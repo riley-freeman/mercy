@@ -1,6 +1,10 @@
 pub mod xpc;
 
-use crate::{alloc::Allocator, pal::DispatchContext};
+use crate::{
+    alloc::Allocator,
+    message::{AllocData, AllocReply, FreeData, MapIdData, Message, MessageType},
+    pal::DispatchContext,
+};
 use derivative::Derivative;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -25,41 +29,6 @@ pub struct AppleContext {
     _handler: Option<Box<dyn Any>>,
     #[derivative(Debug = "ignore")]
     mappings: Arc<Mutex<HashMap<u128, xpc::AppleObject>>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum MessageType {
-    Alloc,
-    Free,
-    MapId,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Message<T> {
-    pub id: i64,
-    pub reply_id: Option<i64>,
-    pub message_type: MessageType,
-    pub message_data: T,
-}
-
-impl<T> Message<T> {
-    pub fn new(id: i64, message_type: MessageType, data: T) -> Self {
-        Self {
-            id,
-            reply_id: None,
-            message_type,
-            message_data: data,
-        }
-    }
-
-    pub fn with_reply(id: i64, reply_id: i64, message_type: MessageType, data: T) -> Self {
-        Self {
-            id,
-            reply_id: Some(reply_id),
-            message_type,
-            message_data: data,
-        }
-    }
 }
 
 unsafe impl Send for AppleContext {}
@@ -177,38 +146,18 @@ impl AppleContext {
 
 impl DispatchContext for AppleContext {}
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AllocData {
-    pub context_id: i64,
-    pub size: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AllocReply {
-    pub alloc_id_high: u64,
-    pub alloc_id_low: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FreeData {
-    pub alloc_id_high: u64,
-    pub alloc_id_low: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MapIdData {
-    pub alloc_id_high: u64,
-    pub alloc_id_low: u64,
-}
-
 impl Allocator for AppleContext {
     fn alloc(&mut self, size: u32) -> Result<u128, crate::error::Error> {
         println!("[DEBUG] [alloc] [apple] size: {}", size);
         // Send message to the XPC manager and wait for a reply
-        let data = AllocData { context_id: self.context_id as i64, size: size as i64 };
+        let data = AllocData {
+            context_id: self.context_id as i64,
+            size: size as i64,
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         self.send_message::<AllocData, AllocReply, _>(data, MessageType::Alloc, move |msg, _| {
-            let alloc_id = (msg.message_data.alloc_id_high as u128) << 64 | (msg.message_data.alloc_id_low as u128);
+            let alloc_id = (msg.message_data.alloc_id_high as u128) << 64
+                | (msg.message_data.alloc_id_low as u128);
             tx.send(alloc_id).ok();
         })
         .map_err(|err| {
