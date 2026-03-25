@@ -109,6 +109,13 @@ impl ContextBuilder {
     }
 
     pub fn build_or_open(mut self) -> ! {
+        let job_name = std::env::var("CRAYON_MERCY_JOB_NAME").unwrap_or(String::from("main"));
+        if job_name.eq("manager") {
+            #[cfg(target_os = "linux")]
+            crate::pal::posix::server::start_server(&self.id).unwrap();
+            exit(0);
+        }
+
         let context = match ContextInner::new(&self.id) {
             Ok(context) => Ok(context),
             // Open if it already exists
@@ -116,10 +123,9 @@ impl ContextBuilder {
             Err(e) => Err(e),
         };
 
-        let job_name = option_env!("CRAYON_MERCY_JOB_NAME").unwrap_or("main");
         let job = self
             .jobs
-            .remove(job_name)
+            .remove(&job_name)
             .expect(&format!("Job {} not found", job_name));
         job(context);
         exit(0)
