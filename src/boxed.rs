@@ -42,6 +42,20 @@ impl<T> HasAllocId for Box<T> {
     }
 }
 
+impl<T> AsRef<T> for Box<T> {
+    fn as_ref(&self) -> &T {
+        let ptr = alloc::map_id(&self.id).unwrap();
+        unsafe { &*(ptr as *const T) }
+    }
+}
+
+impl<T> AsMut<T> for Box<T> {
+    fn as_mut(&mut self) -> &mut T {
+        let ptr = alloc::map_id(&self.id).unwrap();
+        unsafe { &mut *(ptr as *mut T) }
+    }
+}
+
 impl<T: Clone> Clone for Box<T> {
     fn clone(&self) -> Self {
         let new_id = alloc::realloc(&self.id, mem::size_of::<T>() as _).unwrap();

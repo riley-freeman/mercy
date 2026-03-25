@@ -46,6 +46,7 @@ unsafe impl Sync for PosixContext {}
 
 impl Drop for PosixContext {
     fn drop(&mut self) {
+        println!("[DEBUG] [posix] Dropping context...");
         if self.owner {
             // Send a shutdown message to the manager
             self.send_message::<(), (), _>((), MessageType::Shutdown, |_, _| {})
@@ -267,6 +268,10 @@ impl Allocator for PosixContext {
     }
 
     fn map_id(&mut self, id: u128) -> Result<*mut u8, crate::error::Error> {
+        if self.shmems.contains_key(&id) {
+            return Ok(self.shmems[&id].as_ptr());
+        }
+
         let data = MapIdData {
             alloc_id_high: (id >> 64) as u64,
             alloc_id_low: id as u64,

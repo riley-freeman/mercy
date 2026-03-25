@@ -14,6 +14,7 @@ use std::{
 
 use crate::{
     alloc::{self, HasAllocId},
+    context::ContextBuilder,
     error::Error,
 };
 
@@ -222,12 +223,9 @@ impl<T: HasAllocId + Clone> State<T> {
         WatchGuard::new(self.object.alloc_id())
     }
 
-    /// Returns a clone of the object handle stored in this state.
-    pub fn get(&self) -> T
-    where
-        T: Clone,
-    {
-        self.object.clone()
+    /// Returns a reference to the object handle stored in this state.
+    pub fn get(&self) -> &T {
+        &self.object
     }
 
     /// Sets the value stored in the allocation and sends changes to the recorder if recording.
@@ -363,9 +361,50 @@ fn the_first_recording_test() {
                 *r = 0x0;
                 *r = 0x3;
             }
+
             recording.end_recording();
+            let lock = recording.inner.lock().unwrap();
+            assert_eq!(lock.updates.len(), 3);
+
+            let first = lock.updates.get(0).unwrap();
+            assert_eq!(first., vec![0x99]);
+            assert_eq!(first.modified_data, Some(vec![0x1]));
+
+            let second = lock.updates.get(1).unwrap();
+            assert_eq!(second.original_data, vec![0x1]);
+            assert_eq!(second.modified_data, Some(vec![0x2]));
+
+            let third = lock.updates.get(2).unwrap();
+            assert_eq!(third.original_data, vec![0x2]);
+            assert_eq!(third.modified_data, Some(vec![0x3]));
 
             println!("RECORDED DATA: {:?}", recording);
+        })
+        .start();
+}
+
+#[test]
+fn state_callback_test() {
+    use crate::alloc::AllocatesTypes;
+
+    let id = String::from("crayon.mercy.test.rec.state_callback");
+    ContextBuilder::new(&id)
+        .main(|res| {
+            let mut context = res.unwrap();
+            let mut state = State::new(context.new_box(0x99_u8).unwrap()).unwrap();
+
+            let changed = Arc::new(AtomicBool::new(false));
+            let changed_clone = Arc::clone(&changed);
+            state.add_listener_callback(move |_val| {
+                changed_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+
+            assert!(!changed.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(*state.get().as_ref(), 0x99);
+
+            state.set(0x1);
+            assert!(changed.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(*state.get().as_ref(), 0x1);
         })
         .start();
 }
