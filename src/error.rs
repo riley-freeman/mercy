@@ -10,6 +10,9 @@ pub enum Error {
     IdAlreadyExists {
         id: String,
     },
+    IdNotFound {
+        id: String,
+    },
     RequestedAllocInfoNotFound {
         id: u128,
     },
@@ -20,7 +23,7 @@ pub enum Error {
         id: u128,
     },
 
-    JobNameReserved {
+    RoleNameReserved {
         name: String,
     },
 
@@ -43,6 +46,10 @@ pub enum Error {
         io_error: std::io::Error,
     },
 
+    CannotStartProcess {
+        io_error: std::io::Error,
+    },
+
     #[cfg(target_os = "linux")]
     ShmemError {
         shmem_error: shared_memory::ShmemError,
@@ -60,6 +67,7 @@ impl std::fmt::Display for Error {
             Error::InvalidPermissions { id } => write!(f, "Invalid permissions for id: {}", id),
 
             Error::IdAlreadyExists { id } => write!(f, "ID already exists: {}", id),
+            Error::IdNotFound { id } => write!(f, "ID not found: {}", id),
             Error::RequestedAllocInfoNotFound { id } => {
                 write!(f, "ID does not contain the proper information: {}", id)
             }
@@ -70,7 +78,7 @@ impl std::fmt::Display for Error {
                 write!(f, "ID does not contain a registered context: {}", id)
             }
 
-            Error::JobNameReserved { name } => write!(f, "Job name {} is reserved", name),
+            Error::RoleNameReserved { name } => write!(f, "Role name {} is reserved", name),
 
             Error::OperationUnsupported => write!(f, "Operation not supported on this machine"),
 
@@ -93,6 +101,9 @@ impl std::fmt::Display for Error {
             }
 
             Error::IoError { io_error } => write!(f, "IO error: {}", io_error),
+            Error::CannotStartProcess { io_error } => {
+                write!(f, "Failed to start process: {}", io_error)
+            }
 
             #[cfg(target_os = "linux")]
             Error::ShmemError { shmem_error } => write!(f, "Shmem error: {}", shmem_error),

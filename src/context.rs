@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::mem;
+use std::mem::{self, take};
 use std::process::exit;
 use std::sync::{Arc, MutexGuard};
 use std::{collections, sync::LazyLock};
@@ -21,14 +21,14 @@ static PROCESS_CONTEXTS: LazyLock<std::sync::Mutex<collections::HashMap<usize, W
 
 pub struct ContextBuilder {
     id: String,
-    jobs: HashMap<String, Box<dyn FnOnce(Result<Context, error::Error>) -> ()>>,
+    roles: HashMap<String, Box<dyn FnOnce(Result<Context, error::Error>) -> ()>>,
 }
 
 impl std::fmt::Debug for ContextBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContextBuilder")
             .field("id", &self.id)
-            .field("jobs", &self.jobs.keys())
+            .field("roles", &self.roles.keys())
             .finish()
     }
 }
@@ -37,7 +37,7 @@ impl ContextBuilder {
     pub fn new(id: &str) -> Self {
         ContextBuilder {
             id: String::from(id),
-            jobs: HashMap::new(),
+            roles: HashMap::new(),
         }
     }
 
@@ -50,84 +50,52 @@ impl ContextBuilder {
         mut self,
         main: impl FnOnce(Result<Context, error::Error>) -> () + 'static,
     ) -> Self {
-        self.jobs.insert("main".to_string(), Box::new(main));
+        self.roles.insert("main".to_string(), Box::new(main));
         self
     }
 
-    pub fn add_job(
+    pub fn add_role(
         mut self,
-        job: &str,
+        role: &str,
         main: impl FnOnce(Result<Context, error::Error>) -> () + 'static,
     ) -> Self {
-        if job.eq("main") || job.eq("manager") {
+        if role.eq("main") || role.eq("manager") {
             panic!(
                 "{}",
-                crate::error::Error::JobNameReserved {
-                    name: job.to_string()
+                crate::error::Error::RoleNameReserved {
+                    name: role.to_string()
                 }
             );
         }
 
-        self.jobs.insert(job.to_string(), Box::new(main));
+        self.roles.insert(role.to_string(), Box::new(main));
         self
     }
 
-    pub fn build(mut self) -> ! {
-        let job_name = std::env::var("CRAYON_MERCY_JOB_NAME").unwrap_or(String::from("main"));
-        if job_name.eq("manager") {
+    pub fn start(mut self) -> ! {
+        let role_name = std::env::var("CRAYON_MERCY_ROLE_NAME").unwrap_or(String::from("main"));
+        if role_name.eq("manager") {
             #[cfg(target_os = "linux")]
             crate::pal::posix::server::start_server(&self.id).unwrap();
             exit(0);
         }
 
-        let context = ContextInner::new(&self.id);
-        let job = self
-            .jobs
-            .remove(&job_name)
-            .expect(&format!("Job {} not found", job_name));
-        job(context);
-
-        exit(0)
-    }
-
-    pub fn open(mut self) -> ! {
-        let job_name = std::env::var("CRAYON_MERCY_JOB_NAME").unwrap_or(String::from("main"));
-        if job_name.eq("manager") {
-            #[cfg(target_os = "linux")]
-            crate::pal::posix::server::start_server(&self.id).unwrap();
-            exit(0);
-        }
-
-        let context = ContextInner::open(&self.id, false);
-        let job = self
-            .jobs
-            .remove(&job_name)
-            .expect(&format!("Job {} not found", job_name));
-        job(context);
-
-        exit(0)
-    }
-
-    pub fn build_or_open(mut self) -> ! {
-        let job_name = std::env::var("CRAYON_MERCY_JOB_NAME").unwrap_or(String::from("main"));
-        if job_name.eq("manager") {
-            #[cfg(target_os = "linux")]
-            crate::pal::posix::server::start_server(&self.id).unwrap();
-            exit(0);
-        }
+        let take_ownership = if role_name.eq("main") { true } else { false };
 
         let context = match ContextInner::new(&self.id) {
             Ok(context) => Ok(context),
-            // Open if it already exists
-            Err(error::Error::IdAlreadyExists { id: _ }) => ContextInner::open(&self.id, true),
+            // Open if manager is already running
+            Err(error::Error::IdAlreadyExists { id: _ }) => {
+                ContextInner::open(&self.id, take_ownership)
+            }
             Err(e) => Err(e),
         };
 
-        let job = self
-            .jobs
-            .remove(&job_name)
-            .expect(&format!("Job {} not found", job_name));
-        job(context);
+        let role = self
+            .roles
+            .remove(&role_name)
+            .expect(&format!("Role {} not found", role_name));
+        role(context);
         exit(0)
     }
 }
@@ -136,8 +104,6 @@ impl ContextBuilder {
 pub struct ContextInner {
     id: String,
     id_hash: u64,
-    header_id: u16,
-    mappings: std::collections::HashMap<u128, Box<dyn mapping::Mapping>>,
     dispatch: std::boxed::Box<dyn DispatchContext>,
 }
 
@@ -152,15 +118,11 @@ impl ContextInner {
         #[cfg(target_os = "macos")]
         let dispatch = std::boxed::Box::new(AppleContext::new(id_hash));
         #[cfg(target_os = "linux")]
-        let dispatch = std::boxed::Box::new(PosixContext::new(id, id_hash));
-
-        let header_id = 0; // TODO: Source this correctly
+        let dispatch = std::boxed::Box::new(PosixContext::new(id, id_hash)?);
 
         let context_inner = ContextInner {
             id: String::from(id),
             id_hash,
-            header_id,
-            mappings: HashMap::new(),
             dispatch,
         };
 
@@ -168,7 +130,6 @@ impl ContextInner {
             inner: std::sync::Arc::new(std::sync::Mutex::new(context_inner)),
             id: String::from(id),
             id_hash,
-            header_id,
         };
 
         // Add the context to the process contexts
@@ -178,23 +139,19 @@ impl ContextInner {
         Ok(context)
     }
 
-    fn open(id: &str, _take_ownership: bool) -> Result<Context, error::Error> {
+    fn open(id: &str, take_ownership: bool) -> Result<Context, error::Error> {
         let id_hash = hash_id(id);
 
         #[cfg(target_os = "macos")]
-        let dispatch = Box::new(AppleContext::new(id_hash));
+        let dispatch = std::boxed::Box::new(AppleContext::new(id_hash));
         #[cfg(target_os = "ios")]
-        let dispatch = Box::new(AppleContext::new(id_hash));
+        let dispatch = std::boxed::Box::new(AppleContext::new(id_hash));
         #[cfg(target_os = "linux")]
-        let dispatch = std::boxed::Box::new(PosixContext::open(id, id_hash)?);
-
-        let header_id = 0; // TODO: Source this correctly
+        let dispatch = std::boxed::Box::new(PosixContext::open(id, id_hash, take_ownership)?);
 
         let context_inner = ContextInner {
             id: String::from(id),
             id_hash,
-            header_id,
-            mappings: HashMap::new(),
             dispatch,
         };
 
@@ -202,7 +159,6 @@ impl ContextInner {
             inner: std::sync::Arc::new(std::sync::Mutex::new(context_inner)),
             id: String::from(id),
             id_hash,
-            header_id,
         };
 
         // Add the context to the process contexts
@@ -218,7 +174,6 @@ pub struct Context {
     inner: std::sync::Arc<std::sync::Mutex<ContextInner>>,
     id: String,
     id_hash: u64,
-    header_id: u16,
 }
 type WeakContext = std::sync::Weak<std::sync::Mutex<ContextInner>>;
 
@@ -274,7 +229,6 @@ fn check_locked_contexts(
 
             let id = context_inner.id.clone();
             let id_hash = context_inner.id_hash;
-            let header_id = context_inner.header_id;
 
             std::mem::drop(context_inner);
 
@@ -282,7 +236,6 @@ fn check_locked_contexts(
                 inner: context,
                 id,
                 id_hash,
-                header_id,
             };
 
             return Some(context);
@@ -304,28 +257,4 @@ fn hash_id(id: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     hasher.finish()
-}
-
-fn construct_os_id(id_hash: u64, block_id: u16) -> String {
-    let mut os_id = id_hash.to_le_bytes().to_vec();
-    let block_id = block_id.to_string();
-
-    os_id.extend_from_slice(block_id.as_bytes());
-    unproblematicize_id(&mut os_id);
-    String::from_utf8_lossy(&os_id).to_string()
-}
-
-#[cfg(unix)]
-fn unproblematicize_id(id: &mut [u8]) {
-    for v in id {
-        let clamp = *v % 66;
-        *v = match clamp {
-            0..10 => clamp + b'0',
-            10..37 => clamp - 10 + b'A',
-            37..63 => clamp - 37 + b'a',
-            63 => b'.',
-            64 => b'_',
-            _ => b'-',
-        }
-    }
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     env::args,
+    fs,
     io::{Read, Write},
     os::unix::net::UnixStream,
     process::{Command, Stdio},
@@ -25,11 +26,11 @@ pub mod server;
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct PosixContext {
-    manager_stream: Arc<Mutex<UnixStream>>,
+    manager_stream: UnixStream,
     manager_thread: JoinHandle<()>,
     manager_child: Option<std::process::Child>,
 
-    hashed_context_id: u64,
+    hashed_family_id: u64,
 
     #[derivative(Debug = "ignore")]
     reply_closures: Arc<Mutex<HashMap<i64, Box<dyn FnOnce(String) + Send>>>>,
@@ -54,25 +55,34 @@ impl Drop for PosixContext {
 }
 
 impl PosixContext {
-    pub fn new(context_id: &str, hashed_context_id: u64) -> Self {
+    pub fn new(family_id: &str, hashed_family_id: u64) -> Result<Self, Error> {
+        let socket_path = new_unix_socket_path(family_id);
+        // Check if we already have a manager.
+        if fs::exists(&socket_path).map_err(|e| Error::IoError { io_error: e })? {
+            return Err(Error::IdAlreadyExists {
+                id: String::from(family_id),
+            });
+        }
+
         let our_args = args().collect::<Vec<String>>();
         let our_command = our_args[0].clone();
-
-        let socket_path = new_unix_socket_path(context_id);
 
         println!(
             "[DEBUG] [posix] Spawning manager with command: {}",
             our_command
         );
+
+        // Run the program again with different env vars to start the manager.
         let manager_child = Command::new(our_command)
             .args(our_args[1..].iter())
-            .env("CRAYON_MERCY_JOB_NAME", "manager")
+            .env("CRAYON_MERCY_ROLE_NAME", "manager")
             .env("CRAYON_MERCY_POSIX_MANAGER_PATH", &socket_path)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .map_err(|e| Error::CannotStartProcess { io_error: e })?;
 
+        // Connect to the manager, retrying if it's not ready yet.
         let manager_stream = loop {
             match UnixStream::connect(&socket_path) {
                 Ok(stream) => break stream,
@@ -82,55 +92,68 @@ impl PosixContext {
                     {
                         std::thread::sleep(Duration::from_millis(10));
                     } else {
-                        panic!("Failed to connect to manager: {}", e);
+                        return Err(Error::IoError { io_error: e });
                     }
                 }
             }
         };
-        let manager_stream_clone = manager_stream.try_clone().unwrap();
-        let manager_stream = Arc::new(Mutex::new(manager_stream));
 
         let reply_closures = Arc::new(Mutex::new(HashMap::new()));
-        let reply_closures_clone = Arc::clone(&reply_closures);
+        let manager_thread = Self::start_manager_thread(&manager_stream, &reply_closures);
 
-        let manager_thread = std::thread::spawn(move || {
-            Self::handle_messages(manager_stream_clone, reply_closures_clone);
-        });
-
-        Self {
+        Ok(Self {
             manager_stream,
             manager_thread,
             reply_closures,
-            hashed_context_id,
+            hashed_family_id,
             manager_child: Some(manager_child),
             shmems: HashMap::new(),
             owner: true,
-        }
+        })
     }
 
-    pub fn open(context_id: &str, hashed_context_id: u64) -> Result<Self, Error> {
-        let socket_path = new_unix_socket_path(context_id);
+    pub fn open(
+        family_id: &str,
+        hashed_family_id: u64,
+        take_ownership: bool,
+    ) -> Result<Self, Error> {
+        let socket_path = new_unix_socket_path(family_id);
 
-        let manager_stream =
-            UnixStream::connect(&socket_path).map_err(|e| Error::IoError { io_error: e })?;
-        let manager_stream_clone = manager_stream.try_clone().unwrap();
-        let manager_stream = Arc::new(Mutex::new(manager_stream));
+        let manager_stream = UnixStream::connect(&socket_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::IdNotFound {
+                    id: String::from(family_id),
+                }
+            } else {
+                Error::IoError { io_error: e }
+            }
+        })?;
 
+        let manager_stream = manager_stream;
         let reply_closures = Arc::new(Mutex::new(HashMap::new()));
-        let reply_closures_clone = Arc::clone(&reply_closures);
 
-        let manager_thread = std::thread::spawn(move || {
-            Self::handle_messages(manager_stream_clone, reply_closures_clone);
-        });
+        let manager_thread = Self::start_manager_thread(&manager_stream, &reply_closures);
 
         Ok(Self {
             manager_stream,
             manager_thread,
             manager_child: None,
-            hashed_context_id,
+            hashed_family_id,
             reply_closures: Arc::new(Mutex::new(HashMap::new())),
             shmems: HashMap::new(),
-            owner: false,
+            owner: take_ownership,
+        })
+    }
+
+    fn start_manager_thread(
+        stream: &UnixStream,
+        reply_closures: &Arc<Mutex<HashMap<i64, Box<dyn FnOnce(String) + Send>>>>,
+    ) -> JoinHandle<()> {
+        let stream_clone = stream.try_clone().unwrap();
+        let reply_closures_clone = Arc::clone(reply_closures);
+
+        std::thread::spawn(move || {
+            Self::handle_messages(stream_clone, reply_closures_clone);
         })
     }
 
@@ -169,11 +192,7 @@ impl PosixContext {
 
         let msg = Message::new(id, message_type, data);
         let msg_str = serde_json::to_string(&msg).unwrap();
-        self.manager_stream
-            .lock()
-            .unwrap()
-            .write_all(msg_str.as_bytes())
-            .unwrap();
+        self.manager_stream.write_all(msg_str.as_bytes()).unwrap();
 
         Ok(())
     }
@@ -212,7 +231,7 @@ impl Allocator for PosixContext {
     fn alloc(&mut self, size: u32) -> Result<u128, crate::error::Error> {
         // Send message to the server and wait for a reply
         let data = AllocData {
-            context_id: self.hashed_context_id as i64,
+            family_id: self.hashed_family_id as i64,
             size: size as i64,
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -277,8 +296,8 @@ impl Allocator for PosixContext {
     }
 }
 
-fn new_unix_socket_path(context_id: &str) -> String {
-    format!("/tmp/mercy.{}", context_id)
+fn new_unix_socket_path(family_id: &str) -> String {
+    format!("/tmp/mercy.{}", family_id)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

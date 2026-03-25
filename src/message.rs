@@ -39,7 +39,7 @@ impl<T> Message<T> {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AllocData {
-    pub context_id: i64,
+    pub family_id: i64,
     pub size: i64,
 }
 

@@ -18,9 +18,9 @@ use crate::{
     pal::posix::{MapIdReply, new_unix_socket_path},
 };
 
-pub fn start_server(context_id: &str) -> Result<(), Error> {
-    let socket_path = std::env::var("CRAYON_MERCY_POSIX_MANAGER_PATH")
-        .unwrap_or(new_unix_socket_path(context_id));
+pub fn start_server(family_id: &str) -> Result<(), Error> {
+    let socket_path =
+        std::env::var("CRAYON_MERCY_POSIX_MANAGER_PATH").unwrap_or(new_unix_socket_path(family_id));
 
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
@@ -55,13 +55,13 @@ pub fn start_server(context_id: &str) -> Result<(), Error> {
                 );
 
                 // Create a new thread to handle this client's messages.
-                let context_id_clone = String::from(context_id);
+                let family_id_clone = String::from(family_id);
                 let is_running_clone = Arc::clone(&is_running);
                 let socket_path_clone = socket_path.clone();
                 let thread = std::thread::spawn(move || {
                     handle_client_messages(
                         stream,
-                        &context_id_clone,
+                        &family_id_clone,
                         is_running_clone,
                         socket_path_clone,
                     );
@@ -81,6 +81,7 @@ pub fn start_server(context_id: &str) -> Result<(), Error> {
     }
     let _ = std::fs::remove_file(&socket_path);
 
+    println!("[DEBUG] [posix] [server] Goodbye!");
     Ok(())
 }
 
@@ -142,7 +143,7 @@ fn handle_client_messages(
 }
 
 fn handle_alloc_message(
-    context_id: &str,
+    family_id: &str,
     message: Message<AllocData>,
     stream: &mut UnixStream,
     next_block_id: &mut u16,
@@ -150,11 +151,11 @@ fn handle_alloc_message(
 ) -> Result<(), Error> {
     println!("[DEBUG] [posix] [server] Handling alloc message");
     let alloc_data = message.message_data;
-    let context_id_hash = alloc_data.context_id;
+    let family_id_hash = alloc_data.family_id;
 
     let size = alloc_data.size;
 
-    let os_id = format!("{context_id}.mercy_server_block.{next_block_id}");
+    let os_id = format!("{family_id}.mercy_server_block.{next_block_id}");
     let shmem = ShmemConf::new()
         .os_id(&os_id)
         .size(alloc_data.size as usize)
@@ -162,7 +163,7 @@ fn handle_alloc_message(
         .map_err(|e| Error::ShmemError { shmem_error: e })?;
 
     let alloc_id =
-        (context_id_hash as u128) << 64 | (size as u128) << 32 | (*next_block_id as u128) << 16;
+        (family_id_hash as u128) << 64 | (size as u128) << 32 | (*next_block_id as u128) << 16;
 
     allocations.insert(*next_block_id, (os_id, shmem));
     *next_block_id += 1;

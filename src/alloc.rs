@@ -34,9 +34,9 @@ pub fn free(id: &u128) {
     match implementation {
         0 => {
             // Try getting the context
-            let context_id = (id >> 64) as u64;
+            let family_id = (id >> 64) as u64;
 
-            let mut context = match context::check_registered_contexts(context_id) {
+            let mut context = match context::check_registered_contexts(family_id) {
                 Some(context) => context,
                 None => {
                     return;
@@ -60,9 +60,9 @@ pub fn map_id(id: &u128) -> Result<*mut u8, Error> {
     match implementation {
         0 => {
             // Try getting the context
-            let context_id = (id >> 64) as u64;
+            let family_id = (id >> 64) as u64;
 
-            let mut context = match context::check_registered_contexts(context_id) {
+            let mut context = match context::check_registered_contexts(family_id) {
                 Some(context) => context,
                 None => return Err(Error::RequestedContextNotFound { id: *id }),
             };
@@ -110,8 +110,8 @@ pub fn realloc(id: &u128, size: u32) -> Result<u128, Error> {
     match implementation {
         0 => {
             // Try getting the context
-            let context_id = (id >> 64) as u64;
-            let mut context = context::check_registered_contexts(context_id)
+            let family_id = (id >> 64) as u64;
+            let mut context = context::check_registered_contexts(family_id)
                 .ok_or(Error::RequestedContextNotFound { id: *id })?;
 
             context.alloc(size)
@@ -128,8 +128,8 @@ fn the_realloc_test() {
     // Create a new context
     let id = String::from("crayon.mercy.test.alloc.realloc");
 
-    println!("Creating context with id: {}", id);
-    tracing::debug!("Creating context with id: {}", id);
+    println!("Creating context with family ID: {}", id);
+    tracing::debug!("Creating context with family ID: {}", id);
     ContextBuilder::new(&id)
         .main(|res| {
             let mut context = res.unwrap();
@@ -150,5 +150,5 @@ fn the_realloc_test() {
             free(&one);
             free(&two);
         })
-        .build_or_open();
+        .start();
 }

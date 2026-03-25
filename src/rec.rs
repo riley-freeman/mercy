@@ -367,5 +367,5 @@ fn the_first_recording_test() {
 
             println!("RECORDED DATA: {:?}", recording);
         })
-        .build_or_open();
+        .start();
 }

@@ -202,7 +202,7 @@ fn the_string_test() {
 
             assert_eq!(string.as_ref(), "August 13, 2025");
         })
-        .build_or_open();
+        .start();
 }
 
 #[test]
@@ -244,5 +244,5 @@ fn the_extend_test() {
 
             assert_eq!(string.as_ref(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
         })
-        .build_or_open();
+        .start();
 }

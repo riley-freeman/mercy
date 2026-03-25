@@ -21,7 +21,7 @@ use xpc_sys::{
 #[derivative(Debug)]
 pub struct AppleContext {
     xpc_con: xpc_connection_t,
-    context_id: u64,
+    family_id: u64,
     #[derivative(Debug = "ignore")]
     reply_closures: Arc<Mutex<HashMap<i64, Box<dyn FnOnce(xpc::AppleObject) + Send>>>>,
 
@@ -35,7 +35,7 @@ unsafe impl Send for AppleContext {}
 unsafe impl Sync for AppleContext {}
 
 impl AppleContext {
-    pub fn new(context_id: u64) -> Self {
+    pub fn new(family_id: u64) -> Self {
         let reply_closures = Arc::new(Mutex::new(HashMap::new()));
         let mappings = Arc::new(Mutex::new(HashMap::new()));
         let reply_closures_weak = Arc::downgrade(&reply_closures);
@@ -43,7 +43,7 @@ impl AppleContext {
             .expect("id contains interior null byte");
         let mut apple_context = AppleContext {
             xpc_con: std::ptr::null_mut(),
-            context_id,
+            family_id,
             reply_closures,
             _handler: None,
             mappings,
@@ -151,7 +151,7 @@ impl Allocator for AppleContext {
         println!("[DEBUG] [alloc] [apple] size: {}", size);
         // Send message to the XPC manager and wait for a reply
         let data = AllocData {
-            context_id: self.context_id as i64,
+            family_id: self.family_id as i64,
             size: size as i64,
         };
         let (tx, rx) = std::sync::mpsc::channel();

@@ -20,7 +20,7 @@ static NSInteger nextBlockId = 1;
 // ──────────────────────────────────────────────
 
 /// Decode a 16-byte alloc_id and return the blockId.
-/// Layout: [implID: u16][blockID: u16][length: u32][contextID: u64]
+/// Layout: [implID: u16][blockID: u16][length: u32][familyID: u64]
 static uint16_t decode_alloc_id(uint64_t allocIdLow) {
     return (uint16_t)(allocIdLow >> 16);
 }
@@ -35,15 +35,15 @@ static xpc_object_t create_reply_envelope(int64_t originalId, const char *messag
 }
 
 typedef struct {
-    uint64_t high;  // context_id
+    uint64_t high;  // family_id
     uint64_t low;   // size | block_id | implementation
 } alloc_id_t;
 
 /// Encode an alloc_id into out[16].
-/// Layout: [implID: u16 = 0][blockID: u16][length: u32][contextID: u64]
-static alloc_id_t encode_alloc_id(uint64_t context_id, uint16_t block_id, uint32_t length) {
+/// Layout: [implID: u16 = 0][blockID: u16][length: u32][familyID: u64]
+static alloc_id_t encode_alloc_id(uint64_t family_id, uint16_t block_id, uint32_t length) {
     alloc_id_t id;
-    id.high = context_id;
+    id.high = family_id;
     id.low  = ((uint64_t)length << 32) |
         ((uint64_t)block_id << 16) |
         ((uint64_t)0);
@@ -55,7 +55,7 @@ static alloc_id_t encode_alloc_id(uint64_t context_id, uint16_t block_id, uint32
 // ──────────────────────────────────────────────
 
 static void handle_alloc(xpc_connection_t conn, int64_t msgId, xpc_object_t data) {
-    int64_t contextId = xpc_dictionary_get_int64(data, "context_id");
+    int64_t familyId = xpc_dictionary_get_int64(data, "family_id");
     int64_t size = xpc_dictionary_get_int64(data, "size");
     if (size <= 0) return;
 
@@ -73,7 +73,7 @@ static void handle_alloc(xpc_connection_t conn, int64_t msgId, xpc_object_t data
     xpc_object_t reply = create_reply_envelope(msgId, "Alloc");
     xpc_object_t replyData = xpc_dictionary_create(NULL, NULL, 0);
     
-    alloc_id_t alloc_id = encode_alloc_id((uint64_t)contextId, (uint16_t)blockId, (uint32_t)size);
+    alloc_id_t alloc_id = encode_alloc_id((uint64_t)familyId, (uint16_t)blockId, (uint32_t)size);
 
     xpc_dictionary_set_uint64(replyData, "alloc_id_high", alloc_id.high);
     xpc_dictionary_set_uint64(replyData, "alloc_id_low", alloc_id.low);

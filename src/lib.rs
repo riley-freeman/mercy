@@ -39,7 +39,7 @@ mod tests {
 
         println!("Creating context with id: {}", id);
         tracing::debug!("Creating context with id: {}", id);
-        ContextBuilder::new(&id).build_or_open();
+        ContextBuilder::new(&id).start();
     }
 
     // #[test]
@@ -60,11 +60,11 @@ mod tests {
 
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
-        ContextBuilder::new(&id).build_or_open();
+        ContextBuilder::new(&id).start();
     }
 
     #[test]
-    fn the_long_context_id_test() {
+    fn the_long_family_id_test() {
         let id = String::from(
             "crayon.mercy.test.this_is_an_extremely_long_id_that_should_not_be_used_in_production_because_it_is_too_long",
         );
@@ -73,7 +73,7 @@ mod tests {
         tracing::debug!("Creating context with id: {}", id);
         let _context = ContextBuilder::new(&id)
             .main(|_context| println!("Successfully made it to main!"))
-            .build_or_open();
+            .start();
     }
 
     #[test]
@@ -93,7 +93,7 @@ mod tests {
                 context.free(alloc_id_1);
                 context.free(alloc_id_2);
             })
-            .build_or_open();
+            .start();
     }
 
     #[test]
@@ -126,7 +126,7 @@ mod tests {
                     crate::rec::State::new(context.new_box(mark_sadiki.clone()).unwrap()).unwrap();
                 assert_eq!(mark_sadiki, Person::clone(&in_box.watch().unwrap()));
             })
-            .build_or_open();
+            .start();
     }
 
     #[test]
@@ -160,7 +160,7 @@ mod tests {
 
                 println!("Hello World: {}", &k2);
             })
-            .build_or_open();
+            .start();
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
                 std::mem::drop(i);
                 assert!(weak.upgrade().is_err());
             })
-            .build_or_open();
+            .start();
     }
 
     /*
