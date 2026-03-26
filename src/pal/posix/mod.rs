@@ -48,7 +48,9 @@ impl Drop for PosixContext {
     fn drop(&mut self) {
         println!("[DEBUG] [posix] Dropping context...");
         if self.owner {
-            // Send a shutdown message to the manager
+            // Send a shutdown message to the manager (best-effort; the
+            // manager may already have exited, producing a BrokenPipe).
+            // let _ = self.send_message::<(), (), _>((), MessageType::Shutdown, |_, _| {});
             self.send_message::<(), (), _>((), MessageType::Shutdown, |_, _| {})
                 .unwrap();
         }
@@ -193,7 +195,7 @@ impl PosixContext {
 
         let msg = Message::new(id, message_type, data);
         let msg_str = serde_json::to_string(&msg).unwrap();
-        self.manager_stream.write_all(msg_str.as_bytes()).unwrap();
+        self.manager_stream.write_all(msg_str.as_bytes())?;
 
         Ok(())
     }

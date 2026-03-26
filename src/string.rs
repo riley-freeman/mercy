@@ -84,7 +84,6 @@ impl String {
 }
 
 impl HasAllocId for String {
-    type Inner = String;
     fn alloc_id(&self) -> u128 {
         self.id
     }

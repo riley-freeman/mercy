@@ -7,6 +7,7 @@ pub mod message;
 pub mod rec;
 pub mod string;
 pub mod sync;
+pub mod vec;
 
 mod header;
 mod mapping;
@@ -24,7 +25,7 @@ mod tests {
     use std::any::Any;
     use std::fmt::Debug;
 
-    use crate::alloc::{AllocatesTypes, Allocator};
+    use crate::alloc::{AllocatesTypes, Allocator, HasAllocId};
     use crate::context::ContextBuilder;
 
     #[test]
@@ -117,14 +118,14 @@ mod tests {
 
                 let mark_sadiki = Person {
                     name: b"MarkSadiki".clone(),
-                    age: 18,
+                    age: 19,
                     race: b"BLK".clone(),
                     dead: false, // Not yet.
                 };
 
                 let in_box =
                     crate::rec::State::new(context.new_box(mark_sadiki.clone()).unwrap()).unwrap();
-                assert_eq!(mark_sadiki, Person::clone(&in_box.watch().unwrap()));
+                assert_eq!(mark_sadiki, in_box.watch().unwrap().clone());
             })
             .start();
     }

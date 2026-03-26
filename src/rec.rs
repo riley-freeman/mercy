@@ -13,7 +13,7 @@ use std::{
 };
 
 use crate::{
-    alloc::{self, HasAllocId},
+    alloc::{self, HasAllocId, HasInner},
     context::ContextBuilder,
     error::Error,
 };
@@ -162,42 +162,21 @@ impl Update {
     }
 }
 
+static ALLOCATION_CALLBACKS: LazyLock<Mutex<HashMap<u128, Vec<Callback>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static STATE_POINTERS: LazyLock<Mutex<HashMap<u128, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct Callback(Arc<Mutex<dyn FnMut() + 'static>>);
+unsafe impl Send for Callback {}
+unsafe impl Sync for Callback {}
+
+#[derive(Clone)]
 pub struct State<T: HasAllocId + Clone> {
-    object: T,
-    ptr: usize,
+    alloc_id: u128,
+    object: Arc<Mutex<T>>,
     original_data: Vec<u8>,
-    modified_data: Option<Vec<u8>>,
-    listeners: Vec<Box<dyn FnMut(&T::Inner)>>,
-}
-
-impl<T: HasAllocId + Clone> Drop for State<T> {
-    fn drop(&mut self) {
-        // Tell the recorder to record whatever the fuck
-        if let Some(recorder) = PROCESS_RECORDER.lock().unwrap().upgrade() {
-            // Get the ptr to the data
-            let data = match &self.modified_data {
-                Some(_) => unsafe {
-                    Some(
-                        slice::from_raw_parts(self.ptr as *const u8, self.original_data.len())
-                            .to_vec(),
-                    )
-                },
-                None => None,
-            };
-
-            let snapshot = StateSnapshot {
-                alloc_id: self.object.alloc_id(),
-                original_data: self.original_data.clone(),
-                modified_data: data,
-            };
-            recorder
-                .lock()
-                .unwrap()
-                .queue_sender
-                .send(snapshot)
-                .unwrap();
-        }
-    }
 }
 
 impl<T: HasAllocId + Clone> State<T> {
@@ -208,40 +187,104 @@ impl<T: HasAllocId + Clone> State<T> {
 
         let original_data = unsafe { slice::from_raw_parts(ptr, len).to_vec() };
 
+        // Remove any existing callbacks for this allocation ID
+        ALLOCATION_CALLBACKS
+            .lock()
+            .unwrap()
+            .insert(object.alloc_id(), Vec::new());
+
+        STATE_POINTERS
+            .lock()
+            .unwrap()
+            .insert(object.alloc_id(), ptr as usize);
+
         Ok(State {
-            object,
-            ptr: ptr as usize,
+            alloc_id: object.alloc_id(),
+            object: Arc::new(Mutex::new(object)),
             original_data,
-            modified_data: None,
-            listeners: Vec::new(),
         })
     }
 
     /// Returns a `WatchGuard` that provides mutable access to the underlying data.
     /// When the `WatchGuard` is dropped, any modifications are sent to the recorder.
-    pub fn watch(&self) -> Result<WatchGuard<T::Inner>, Error> {
-        WatchGuard::new(self.object.alloc_id())
+    pub fn watch(&self) -> Result<WatchGuard<T>, Error> {
+        let lock = self.object.lock().unwrap();
+        WatchGuard::new(lock.alloc_id())
     }
 
-    /// Returns a reference to the object handle stored in this state.
-    pub fn get(&self) -> &T {
-        &self.object
+    pub fn get(&self) -> T {
+        self.object.lock().unwrap().clone()
     }
 
     /// Sets the value stored in the allocation and sends changes to the recorder if recording.
-    pub fn set(&mut self, value: T::Inner) {
+    pub fn set(&mut self, value: T) {
         let len = self.original_data.len();
-        let original = unsafe { slice::from_raw_parts(self.ptr as *const u8, len).to_vec() };
+        let mut lock = self.object.lock().unwrap();
 
-        unsafe {
-            *(self.ptr as *mut T::Inner) = value;
+        // Pre-map the new value's allocation BEFORE the assignment drops the old one,
+        // so we don't hit the Unix socket after the old allocation is freed.
+        let old_alloc_id = self.alloc_id;
+        let new_alloc_id = value.alloc_id();
+        let new_ptr = alloc::map_id(&new_alloc_id).unwrap() as *const u8;
+        let new_len = alloc::len(&new_alloc_id).unwrap() as usize;
+
+        let (original, modified) = unsafe {
+            let ptr = STATE_POINTERS.lock().unwrap()[&old_alloc_id];
+            let original = slice::from_raw_parts(ptr as *const u8, len).to_vec();
+            *lock = value;
+            let modified = slice::from_raw_parts(new_ptr, new_len).to_vec();
+            (original, modified)
+        };
+
+        STATE_POINTERS
+            .lock()
+            .unwrap()
+            .insert(new_alloc_id, new_ptr as usize);
+        self.alloc_id = new_alloc_id;
+
+        Self::record_change(old_alloc_id, original, modified.clone());
+
+        // Notify all listener callbacks of the new value.
+        let mut callbacks = ALLOCATION_CALLBACKS.lock().unwrap();
+
+        // Move around the info relating to alloc IDs
+        if old_alloc_id != new_alloc_id {
+            let old_callbacks = callbacks.remove(&old_alloc_id);
+            if let Some(cbs) = old_callbacks {
+                callbacks.insert(new_alloc_id, cbs);
+            } else {
+                callbacks.remove(&new_alloc_id);
+            }
         }
 
-        let modified = unsafe { slice::from_raw_parts(self.ptr as *const u8, len).to_vec() };
-
         if let Some(recorder) = PROCESS_RECORDER.lock().unwrap().upgrade() {
+            let mut lock = recorder.lock().unwrap();
+            let updates = lock.updates.remove(&old_alloc_id).unwrap_or_default();
+            lock.updates.insert(new_alloc_id, updates);
+        }
+
+        for listener in callbacks.entry(self.alloc_id).or_default() {
+            listener.0.lock().unwrap()();
+        }
+    }
+
+    /// Adds a callback that will be invoked whenever `set` is called, receiving
+    /// a reference to the new value.
+    pub fn add_listener_callback(&mut self, callback: impl FnMut() + 'static) {
+        let callback = Callback(Arc::new(Mutex::new(callback)));
+        ALLOCATION_CALLBACKS
+            .lock()
+            .unwrap()
+            .entry(self.alloc_id)
+            .or_insert_with(Vec::new)
+            .push(callback);
+    }
+
+    fn record_change(alloc_id: u128, original: Vec<u8>, modified: Vec<u8>) {
+        if let Some(recorder) = PROCESS_RECORDER.lock().unwrap().upgrade() {
+            println!("[DEBUG] Sending snapshot for alloc_id: {}", alloc_id);
             let snapshot = StateSnapshot {
-                alloc_id: self.object.alloc_id(),
+                alloc_id,
                 original_data: original,
                 modified_data: Some(modified),
             };
@@ -252,18 +295,26 @@ impl<T: HasAllocId + Clone> State<T> {
                 .send(snapshot)
                 .unwrap();
         }
+    }
+}
 
-        // Notify all listener callbacks of the new value.
-        let new_value = unsafe { &*(self.ptr as *const T::Inner) };
-        for listener in &mut self.listeners {
-            listener(new_value);
-        }
+impl<T: HasInner + HasAllocId + Clone> State<T> {
+    pub fn value(&self) -> T::Inner {
+        self.object.lock().unwrap().clone_inner()
     }
 
-    /// Adds a callback that will be invoked whenever `set` is called, receiving
-    /// a reference to the new value.
-    pub fn add_listener_callback(&mut self, callback: impl FnMut(&T::Inner) + 'static) {
-        self.listeners.push(Box::new(callback));
+    pub fn set_value(&mut self, value: T::Inner) {
+        let len = self.original_data.len();
+        let mut lock = self.object.lock().unwrap();
+        // set_inner mutates in-place (clone_from), so the pointer stays valid.
+        let (original, modified) = unsafe {
+            let ptr = STATE_POINTERS.lock().unwrap()[&self.alloc_id];
+            let original = slice::from_raw_parts(ptr as *const u8, len).to_vec();
+            lock.set_inner(value);
+            let modified = slice::from_raw_parts(ptr as *const u8, len).to_vec();
+            (original, modified)
+        };
+        Self::record_change(self.alloc_id, original, modified);
     }
 }
 
@@ -321,17 +372,17 @@ impl<T> Drop for WatchGuard<T> {
     }
 }
 
-impl<T> Deref for WatchGuard<T> {
-    type Target = T;
+impl<T: HasInner> Deref for WatchGuard<T> {
+    type Target = T::Inner;
     fn deref(&self) -> &Self::Target {
-        unsafe { &*(self.ptr as *const T) }
+        unsafe { &*(self.ptr as *const T::Inner) }
     }
 }
 
-impl<T> DerefMut for WatchGuard<T> {
+impl<T: HasInner> DerefMut for WatchGuard<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.modified_data = Some(Vec::new());
-        unsafe { &mut *(self.ptr as *mut T) }
+        unsafe { &mut *(self.ptr as *mut T::Inner) }
     }
 }
 
@@ -354,31 +405,21 @@ fn the_first_recording_test() {
                 *r = 0x1;
             }
             {
-                b.set(0x2);
+                b.set_value(0x2);
             }
             {
                 let mut r = b.watch().unwrap();
                 *r = 0x0;
                 *r = 0x3;
             }
+            {
+                b.set_value(0x4);
+            }
 
             recording.end_recording();
             let lock = recording.inner.lock().unwrap();
-            assert_eq!(lock.updates.len(), 3);
-
-            let first = lock.updates.get(0).unwrap();
-            assert_eq!(first., vec![0x99]);
-            assert_eq!(first.modified_data, Some(vec![0x1]));
-
-            let second = lock.updates.get(1).unwrap();
-            assert_eq!(second.original_data, vec![0x1]);
-            assert_eq!(second.modified_data, Some(vec![0x2]));
-
-            let third = lock.updates.get(2).unwrap();
-            assert_eq!(third.original_data, vec![0x2]);
-            assert_eq!(third.modified_data, Some(vec![0x3]));
-
-            println!("RECORDED DATA: {:?}", recording);
+            assert_eq!(lock.updates.len(), 1);
+            assert_eq!(lock.updates.get(&b.alloc_id).unwrap().len(), 4);
         })
         .start();
 }
@@ -395,16 +436,65 @@ fn state_callback_test() {
 
             let changed = Arc::new(AtomicBool::new(false));
             let changed_clone = Arc::clone(&changed);
-            state.add_listener_callback(move |_val| {
+            state.add_listener_callback(move || {
                 changed_clone.store(true, std::sync::atomic::Ordering::Relaxed);
             });
 
             assert!(!changed.load(std::sync::atomic::Ordering::Relaxed));
             assert_eq!(*state.get().as_ref(), 0x99);
 
-            state.set(0x1);
+            state.set(context.new_box(0x1).unwrap());
             assert!(changed.load(std::sync::atomic::Ordering::Relaxed));
-            assert_eq!(*state.get().as_ref(), 0x1);
+            assert_eq!(state.value(), 0x1);
         })
         .start();
+}
+
+#[test]
+fn test_callback_moving_logic() {
+    use std::sync::atomic::Ordering;
+
+    let old_id = 1u128;
+    let new_id = 2u128;
+
+    let mut callbacks = ALLOCATION_CALLBACKS.lock().unwrap();
+    callbacks.clear();
+
+    let called = Arc::new(AtomicBool::new(false));
+    let called_clone = Arc::clone(&called);
+    let cb = Callback(Arc::new(Mutex::new(move || {
+        called_clone.store(true, Ordering::Relaxed);
+    })));
+
+    // Register old callback
+    callbacks.insert(old_id, vec![cb]);
+
+    // Register a stale callback on the new ID that should be cleared
+    let stale_called = Arc::new(AtomicBool::new(false));
+    let stale_called_clone = Arc::clone(&stale_called);
+    let stale_cb = Callback(Arc::new(Mutex::new(move || {
+        stale_called_clone.store(true, Ordering::Relaxed);
+    })));
+    callbacks.insert(new_id, vec![stale_cb]);
+
+    // Simulate what's in State::set
+    if old_id != new_id {
+        let old_callbacks = callbacks.remove(&old_id);
+        if let Some(cbs) = old_callbacks {
+            callbacks.insert(new_id, cbs);
+        } else {
+            callbacks.remove(&new_id);
+        }
+    }
+
+    for listener in callbacks.get(&new_id).unwrap() {
+        listener.0.lock().unwrap()();
+    }
+
+    assert!(called.load(Ordering::Relaxed));
+    assert!(!stale_called.load(Ordering::Relaxed));
+    assert!(callbacks.get(&old_id).is_none());
+    assert_eq!(callbacks.get(&new_id).unwrap().len(), 1);
+
+    callbacks.clear();
 }

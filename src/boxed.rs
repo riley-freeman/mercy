@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{self, Allocator, HasAllocId},
+    alloc::{self, Allocator, HasAllocId, HasInner},
     error::Error,
 };
 use std::{
@@ -35,8 +35,20 @@ impl<T> Box<T> {
     }
 }
 
-impl<T> HasAllocId for Box<T> {
+impl<T: Clone> HasInner for Box<T> {
     type Inner = T;
+    fn clone_inner(&self) -> Self::Inner {
+        let ptr = alloc::map_id(&self.id).unwrap();
+        unsafe { &*(ptr as *const T) }.clone()
+    }
+    fn set_inner(&mut self, value: Self::Inner) {
+        let ptr = alloc::map_id(&self.id).unwrap();
+        unsafe { &mut *(ptr as *mut T) }.clone_from(&value);
+    }
+}
+
+impl<T: Clone> HasAllocId for Box<T> {
+    // type Inner = T;
     fn alloc_id(&self) -> u128 {
         self.id
     }

@@ -1,3 +1,5 @@
+use syn::token::Super;
+
 use super::context;
 use crate::error::Error;
 
@@ -9,8 +11,13 @@ pub trait Allocator {
 }
 
 pub trait HasAllocId {
-    type Inner;
     fn alloc_id(&self) -> u128;
+}
+
+pub trait HasInner {
+    type Inner: Clone;
+    fn clone_inner(&self) -> Self::Inner;
+    fn set_inner(&mut self, value: Self::Inner);
 }
 
 pub trait AllocatesTypes: Allocator + Sized {
@@ -24,6 +31,14 @@ pub trait AllocatesTypes: Allocator + Sized {
 
     fn new_string(&mut self, value: &str) -> Result<super::string::String, Error> {
         crate::string::String::new(self, value)
+    }
+
+    fn new_vec<T>(&mut self) -> Result<super::vec::Vec<T>, Error> {
+        crate::vec::Vec::new(self)
+    }
+
+    fn new_vec_with_capacity<T>(&mut self, capacity: usize) -> Result<super::vec::Vec<T>, Error> {
+        crate::vec::Vec::with_capacity(self, capacity)
     }
 }
 
