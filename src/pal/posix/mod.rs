@@ -194,7 +194,8 @@ impl PosixContext {
         );
 
         let msg = Message::new(id, message_type, data);
-        let msg_str = serde_json::to_string(&msg).unwrap();
+        let mut msg_str = serde_json::to_string(&msg).unwrap();
+        msg_str.push('\n');
         self.manager_stream.write_all(msg_str.as_bytes())?;
 
         Ok(())
@@ -205,6 +206,7 @@ impl PosixContext {
         reply_closures: Arc<Mutex<HashMap<i64, Box<dyn FnOnce(String) + Send>>>>,
     ) {
         let mut buffer = [0; 1024];
+        let mut pending = String::new();
         loop {
             let length = manager_stream.read(&mut buffer).unwrap();
             // If the manager stream is closed, break the loop.
@@ -212,17 +214,27 @@ impl PosixContext {
                 break;
             }
 
-            let msg_str = String::from_utf8_lossy(&buffer[..length]);
-            let msg: Message<serde_json::Value> = serde_json::from_str(&msg_str).unwrap();
+            pending.push_str(&String::from_utf8_lossy(&buffer[..length]));
 
-            if msg.reply_id.is_none() {
-                // Handle a message sent to us (no reply id means it's not a reply)
-                continue;
-            }
+            // Process all complete newline-delimited messages.
+            while let Some(newline_pos) = pending.find('\n') {
+                let line: String = pending.drain(..=newline_pos).collect();
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
 
-            let mut reply_closures = reply_closures.lock().unwrap();
-            if let Some(callback) = reply_closures.remove(&msg.reply_id.unwrap()) {
-                callback(msg_str.to_string());
+                let msg: Message<serde_json::Value> = serde_json::from_str(line).unwrap();
+
+                if msg.reply_id.is_none() {
+                    // Handle a message sent to us (no reply id means it's not a reply)
+                    continue;
+                }
+
+                let mut reply_closures = reply_closures.lock().unwrap();
+                if let Some(callback) = reply_closures.remove(&msg.reply_id.unwrap()) {
+                    callback(line.to_string());
+                }
             }
         }
     }

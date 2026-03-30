@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, LinkedList},
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     process::exit,
@@ -93,7 +93,11 @@ fn handle_client_messages(
 ) {
     let mut buffer = [0; 1024];
     let mut allocations = HashMap::new();
+
     let mut next_block_id = 0;
+    let mut available_blocks = LinkedList::new();
+
+    let mut pending = String::new();
 
     loop {
         let bytes_read = stream.read(&mut buffer).unwrap();
@@ -103,42 +107,55 @@ fn handle_client_messages(
             break;
         }
 
-        let string_buffer = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
-        println!(
-            "[DEBUG] [posix] [server] Received message of length {bytes_read}: {string_buffer}",
-        );
-        let value: Value = serde_json::from_str(&string_buffer).unwrap();
+        pending.push_str(&String::from_utf8_lossy(&buffer[..bytes_read]));
 
-        let message_type = value.get("message_type").unwrap().as_str().unwrap();
-        match message_type {
-            "Alloc" => handle_alloc_message(
-                client_id,
-                serde_json::from_value(value).unwrap(),
-                &mut stream,
-                &mut next_block_id,
-                &mut allocations,
-            ),
-
-            "Free" => handle_free_message(serde_json::from_value(value).unwrap(), &mut allocations),
-
-            "MapId" => handle_map_id_message(
-                serde_json::from_value(value).unwrap(),
-                &mut stream,
-                &mut allocations,
-            ),
-
-            "Shutdown" => {
-                // set running to false and start a dummy connection
-                is_running.store(false, Ordering::Relaxed);
-                let _ = UnixStream::connect(socket_path);
-                break;
+        // Process all complete newline-delimited messages in the buffer.
+        while let Some(newline_pos) = pending.find('\n') {
+            let line: String = pending.drain(..=newline_pos).collect();
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
 
-            _ => Err(Error::UnexpectedMessageType {
-                message_type: message_type.to_string(),
-            }),
+            println!("[DEBUG] [posix] [server] Received message: {line}",);
+            let value: Value = serde_json::from_str(line).unwrap();
+
+            let message_type = value.get("message_type").unwrap().as_str().unwrap();
+            match message_type {
+                "Alloc" => handle_alloc_message(
+                    client_id,
+                    serde_json::from_value(value).unwrap(),
+                    &mut stream,
+                    &mut next_block_id,
+                    &mut available_blocks,
+                    &mut allocations,
+                ),
+
+                "Free" => handle_free_message(
+                    serde_json::from_value(value).unwrap(),
+                    &mut allocations,
+                    &mut available_blocks,
+                ),
+
+                "MapId" => handle_map_id_message(
+                    serde_json::from_value(value).unwrap(),
+                    &mut stream,
+                    &mut allocations,
+                ),
+
+                "Shutdown" => {
+                    // set running to false and start a dummy connection
+                    is_running.store(false, Ordering::Relaxed);
+                    let _ = UnixStream::connect(&socket_path);
+                    return;
+                }
+
+                _ => Err(Error::UnexpectedMessageType {
+                    message_type: message_type.to_string(),
+                }),
+            }
+            .unwrap()
         }
-        .unwrap()
     }
 }
 
@@ -147,26 +164,48 @@ fn handle_alloc_message(
     message: Message<AllocData>,
     stream: &mut UnixStream,
     next_block_id: &mut u16,
+    available_blocks: &mut LinkedList<u16>,
     allocations: &mut HashMap<u16, (String, Shmem)>,
 ) -> Result<(), Error> {
     println!("[DEBUG] [posix] [server] Handling alloc message");
+    println!("[DEBUG] [posix] [server] Allocating block_id.");
+
     let alloc_data = message.message_data;
     let family_id_hash = alloc_data.family_id;
-
     let size = alloc_data.size;
 
-    let os_id = format!("{family_id}.mercy_server_block.{next_block_id}");
-    let shmem = ShmemConf::new()
-        .os_id(&os_id)
-        .size(alloc_data.size as usize)
-        .create()
-        .map_err(|e| Error::ShmemError { shmem_error: e })?;
+    let mut block_id = available_blocks.pop_front().unwrap_or(*next_block_id);
+    if block_id == *next_block_id {
+        *next_block_id += 1;
+    }
 
-    let alloc_id =
-        (family_id_hash as u128) << 64 | (size as u128) << 32 | (*next_block_id as u128) << 16;
+    let (shmem, os_id) = loop {
+        let os_id = format!("{family_id}.mercy_server_block.{block_id}");
+        let res = ShmemConf::new()
+            .os_id(&os_id)
+            .size(alloc_data.size as usize)
+            .create();
+        println!(
+            "[DEBUG] [posix] [server] Created shmem with os_id: {}",
+            os_id
+        );
 
-    allocations.insert(*next_block_id, (os_id, shmem));
-    *next_block_id += 1;
+        match res {
+            Ok(shmem) => break (shmem, os_id),
+            Err(shared_memory::ShmemError::MappingIdExists) => {
+                eprintln!("[ERROR] [posix] [server] block already in use, retrying!");
+                block_id = available_blocks.pop_front().unwrap_or(*next_block_id);
+                if block_id == *next_block_id {
+                    *next_block_id += 1;
+                }
+            }
+            Err(e) => return Err(Error::ShmemError { shmem_error: e }),
+        }
+    };
+
+    let alloc_id = (family_id_hash as u128) << 64 | (size as u128) << 32 | (block_id as u128) << 16;
+
+    allocations.insert(block_id, (os_id, shmem));
 
     let reply = Message::with_reply(
         message.id,
@@ -178,9 +217,9 @@ fn handle_alloc_message(
         },
     );
 
-    stream
-        .write_all(&serde_json::to_vec(&reply).unwrap())
-        .unwrap();
+    let mut bytes = serde_json::to_vec(&reply).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).unwrap();
 
     Ok(())
 }
@@ -188,9 +227,11 @@ fn handle_alloc_message(
 fn handle_free_message(
     message: Message<FreeData>,
     allocations: &mut HashMap<u16, (String, Shmem)>,
+    available_blocks: &mut LinkedList<u16>,
 ) -> Result<(), Error> {
     let block_id = (message.message_data.alloc_id_low >> 16) as u16;
     allocations.remove(&block_id);
+    available_blocks.push_back(block_id);
 
     Ok(())
 }
@@ -212,8 +253,8 @@ fn handle_map_id_message(
         os_id: os_id.clone(),
     };
     let reply = Message::with_reply(message.id, message.id, MessageType::MapId, data);
-    stream
-        .write_all(&serde_json::to_vec(&reply).unwrap())
-        .unwrap();
+    let mut bytes = serde_json::to_vec(&reply).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).unwrap();
     Ok(())
 }

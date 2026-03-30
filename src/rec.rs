@@ -1,6 +1,7 @@
 use core::time;
 use std::{
     collections::{HashMap, LinkedList},
+    fmt::{self, Debug, Display},
     marker::PhantomData,
     ops::{Deref, DerefMut},
     slice,
@@ -315,6 +316,37 @@ impl<T: HasInner + HasAllocId + Clone> State<T> {
             (original, modified)
         };
         Self::record_change(self.alloc_id, original, modified);
+    }
+}
+
+impl<T: Debug + HasAllocId + Clone> Debug for State<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.get())
+    }
+}
+
+impl<T: Display + HasAllocId + Clone> Display for State<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+impl<T: HasInner + HasAllocId + Clone> From<T> for State<T> {
+    fn from(value: T) -> Self {
+        Self::new(value).unwrap()
+    }
+}
+
+impl<T: HasAllocId + Clone> AsRef<T> for State<T> {
+    fn as_ref(&self) -> &T {
+        let ptr = STATE_POINTERS.lock().unwrap()[&self.alloc_id];
+        unsafe { &*(ptr as *const T) }
+    }
+}
+
+impl<T: HasAllocId + Clone> PartialEq for State<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.alloc_id == other.alloc_id
     }
 }
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::mem::{self, take};
 use std::process::exit;
-use std::sync::{Arc, MutexGuard};
+use std::sync::MutexGuard;
+use std::sync::atomic::AtomicUsize;
 use std::{collections, sync::LazyLock};
 
 use crate::pal::DispatchContext;
@@ -14,10 +14,13 @@ use crate::pal::apple::AppleContext;
 use crate::pal::posix::PosixContext;
 
 use super::error;
-use super::mapping;
 
-static PROCESS_CONTEXTS: LazyLock<std::sync::Mutex<collections::HashMap<usize, WeakContext>>> =
-    LazyLock::new(|| std::sync::Mutex::new(collections::HashMap::new()));
+pub static PROCESS_CONTEXTS: LazyLock<
+    std::sync::Mutex<collections::HashMap<usize, std::sync::Arc<std::sync::Mutex<ContextInner>>>>,
+> = LazyLock::new(|| std::sync::Mutex::new(collections::HashMap::new()));
+
+pub static MANAGER_CONTEXT: LazyLock<std::sync::Mutex<Option<Context>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
 
 pub struct ContextBuilder {
     id: String,
@@ -126,15 +129,15 @@ impl ContextInner {
             dispatch,
         };
 
-        let context = Context {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(context_inner)),
-            id: String::from(id),
-            id_hash,
-        };
+        let inner = std::sync::Arc::new(std::sync::Mutex::new(context_inner));
+        let context = Context { id_hash };
 
         // Add the context to the process contexts
         let mut guard = PROCESS_CONTEXTS.lock().unwrap();
-        register_context(&mut guard, &context);
+        register_context(&mut guard, id_hash, inner);
+
+        let mut guard = MANAGER_CONTEXT.lock().unwrap();
+        *guard = Some(context);
 
         Ok(context)
     }
@@ -155,45 +158,60 @@ impl ContextInner {
             dispatch,
         };
 
-        let context = Context {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(context_inner)),
-            id: String::from(id),
-            id_hash,
-        };
+        let inner = std::sync::Arc::new(std::sync::Mutex::new(context_inner));
+        let context = Context { id_hash };
 
         // Add the context to the process contexts
         let mut guard = PROCESS_CONTEXTS.lock().unwrap();
-        register_context(&mut guard, &context);
+        register_context(&mut guard, id_hash, inner);
+
+        if take_ownership {
+            let mut guard = MANAGER_CONTEXT.lock().unwrap();
+            *guard = Some(context);
+        }
 
         Ok(context)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Context {
-    inner: std::sync::Arc<std::sync::Mutex<ContextInner>>,
-    id: String,
     id_hash: u64,
 }
-type WeakContext = std::sync::Weak<std::sync::Mutex<ContextInner>>;
 
 impl Context {
+    fn inner(&self) -> std::sync::Arc<std::sync::Mutex<ContextInner>> {
+        let guard = PROCESS_CONTEXTS.lock().unwrap();
+        guard
+            .get(&(self.id_hash as usize))
+            .expect("Context not found in global registry")
+            .clone()
+    }
+
     pub fn id(&self) -> String {
-        self.id.clone()
+        self.inner().lock().unwrap().id.clone()
+    }
+
+    pub fn close(&self) {
+        let _arc = {
+            let mut guard = PROCESS_CONTEXTS.lock().unwrap();
+            guard.remove(&(self.id_hash as usize))
+        };
+        // guard is released, _arc drops here safely
     }
 }
 
 impl crate::alloc::Allocator for Context {
     fn alloc(&mut self, size: u32) -> Result<u128, error::Error> {
-        self.inner.lock().unwrap().dispatch.alloc(size)
+        self.inner().lock().unwrap().dispatch.alloc(size)
     }
 
     fn free(&mut self, id: u128) {
-        self.inner.lock().unwrap().dispatch.free(id)
+        self.inner().lock().unwrap().dispatch.free(id)
     }
 
     fn map_id(&mut self, id: u128) -> Result<*mut u8, error::Error> {
-        self.inner.lock().unwrap().dispatch.map_id(id)
+        self.inner().lock().unwrap().dispatch.map_id(id)
     }
 }
 
@@ -207,41 +225,31 @@ impl Drop for ContextInner {
     }
 }
 
-pub fn lock_context_database<'a>() -> MutexGuard<'a, HashMap<usize, WeakContext>> {
+pub fn lock_context_database<'a>()
+-> MutexGuard<'a, HashMap<usize, std::sync::Arc<std::sync::Mutex<ContextInner>>>> {
     PROCESS_CONTEXTS.lock().unwrap()
 }
 
-fn register_context(guard: &mut MutexGuard<HashMap<usize, WeakContext>>, context: &Context) {
-    let id_hash = context.inner.lock().unwrap().id_hash;
+fn register_context(
+    guard: &mut MutexGuard<HashMap<usize, std::sync::Arc<std::sync::Mutex<ContextInner>>>>,
+    id_hash: u64,
+    inner: std::sync::Arc<std::sync::Mutex<ContextInner>>,
+) {
     if guard.contains_key(&(id_hash as usize)) {
-        return; // Start praying.
+        return; // Already registered
     }
-    guard.insert(id_hash as usize, std::sync::Arc::downgrade(&context.inner));
+    guard.insert(id_hash as usize, inner);
 }
 
 fn check_locked_contexts(
-    guard: &MutexGuard<HashMap<usize, WeakContext>>,
+    guard: &MutexGuard<HashMap<usize, std::sync::Arc<std::sync::Mutex<ContextInner>>>>,
     id_hash: u64,
 ) -> Option<Context> {
-    if let Some(context) = guard.get(&(id_hash as _)) {
-        if let Some(context) = context.upgrade() {
-            let context_inner = context.lock().unwrap();
-
-            let id = context_inner.id.clone();
-            let id_hash = context_inner.id_hash;
-
-            std::mem::drop(context_inner);
-
-            let context = Context {
-                inner: context,
-                id,
-                id_hash,
-            };
-
-            return Some(context);
-        }
+    if guard.contains_key(&(id_hash as _)) {
+        Some(Context { id_hash })
+    } else {
+        None
     }
-    None
 }
 
 pub fn check_registered_contexts(id_hash: u64) -> Option<Context> {
@@ -249,7 +257,10 @@ pub fn check_registered_contexts(id_hash: u64) -> Option<Context> {
     check_locked_contexts(&lock, id_hash)
 }
 
-fn unregister_context(guard: &mut MutexGuard<HashMap<usize, WeakContext>>, id_hash: u64) {
+fn unregister_context(
+    guard: &mut MutexGuard<HashMap<usize, std::sync::Arc<std::sync::Mutex<ContextInner>>>>,
+    id_hash: u64,
+) {
     let _ = guard.remove(&(id_hash as usize));
 }
 

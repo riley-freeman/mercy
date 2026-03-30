@@ -1,13 +1,13 @@
 use core::{fmt, slice};
 use std::{
-    fmt::Display,
+    fmt::{Debug, Display},
     ops::{Add, AddAssign, Deref},
 };
 
 use libc::strlen;
 
 use crate::{
-    alloc::{self, Allocator, HasAllocId},
+    alloc::{self, Allocator, HasAllocId, HasInner},
     error::Error,
 };
 
@@ -89,6 +89,44 @@ impl HasAllocId for String {
     }
 }
 
+impl HasInner for String {
+    type Inner = std::string::String;
+
+    fn clone_inner(&self) -> Self::Inner {
+        let ptr = alloc::map_id(&self.id).unwrap();
+        let len = unsafe { strlen(ptr as _) };
+        let slice = unsafe { slice::from_raw_parts(ptr, len) };
+        unsafe { std::string::String::from_utf8_unchecked(slice.to_vec()) }
+    }
+
+    fn set_inner(&mut self, value: Self::Inner) {
+        let new_len = value.len() as u32;
+        let new_id = alloc::realloc(&self.id, new_len + 1).unwrap();
+
+        unsafe {
+            let ptr = alloc::map_id(&new_id).unwrap();
+            let len = new_len as usize;
+            libc::memcpy(ptr as _, value.as_ptr() as _, len);
+            libc::memcpy(ptr.byte_add(len) as _, &0 as *const _ as _, 1);
+        }
+
+        alloc::free(&self.id);
+        self.id = new_id;
+    }
+}
+
+impl Display for String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
+impl Debug for String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
 impl AsRef<str> for String {
     fn as_ref(&self) -> &str {
         unsafe {
@@ -104,12 +142,6 @@ impl Deref for String {
     type Target = str;
     fn deref(&self) -> &Self::Target {
         self.as_ref()
-    }
-}
-
-impl Display for String {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.as_ref())
     }
 }
 

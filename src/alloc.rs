@@ -66,8 +66,6 @@ pub fn free(id: &u128) {
 
 pub fn map_id(id: &u128) -> Result<*mut u8, Error> {
     let implementation = *id as u16;
-    println!("[DEBUG] [map_id] implementation: {}", implementation);
-
     if id.eq(&0_u128) {
         return Err(Error::BlockNotFound { allocation_id: *id });
     }
@@ -83,6 +81,10 @@ pub fn map_id(id: &u128) -> Result<*mut u8, Error> {
             };
 
             context.map_id(*id)
+        }
+        1 => {
+            // This is an allocation made in our address space
+            Ok((id >> 64) as usize as *mut u8)
         }
         _ => Err(Error::OperationUnsupported),
     }
