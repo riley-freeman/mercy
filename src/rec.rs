@@ -169,7 +169,8 @@ static ALLOCATION_CALLBACKS: LazyLock<Mutex<HashMap<u128, Vec<Callback>>>> =
 static STATE_POINTERS: LazyLock<Mutex<HashMap<u128, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-struct Callback(Arc<Mutex<dyn FnMut() + 'static>>);
+#[derive(Clone)]
+struct Callback(Arc<Mutex<dyn FnMut(&dyn std::any::Any) + Send + 'static>>);
 unsafe impl Send for Callback {}
 unsafe impl Sync for Callback {}
 
@@ -237,6 +238,8 @@ impl<T: HasAllocId + Clone> State<T> {
             (original, modified)
         };
 
+        drop(lock);
+
         STATE_POINTERS
             .lock()
             .unwrap()
@@ -264,22 +267,15 @@ impl<T: HasAllocId + Clone> State<T> {
             lock.updates.insert(new_alloc_id, updates);
         }
 
-        for listener in callbacks.entry(self.alloc_id).or_default() {
-            listener.0.lock().unwrap()();
+        let listeners = callbacks.get(&self.alloc_id).cloned().unwrap_or_default();
+        drop(callbacks);
+
+        for listener in listeners {
+            listener.0.lock().unwrap()(&() as &dyn std::any::Any);
         }
     }
 
-    /// Adds a callback that will be invoked whenever `set` is called, receiving
-    /// a reference to the new value.
-    pub fn add_listener_callback(&mut self, callback: impl FnMut() + 'static) {
-        let callback = Callback(Arc::new(Mutex::new(callback)));
-        ALLOCATION_CALLBACKS
-            .lock()
-            .unwrap()
-            .entry(self.alloc_id)
-            .or_insert_with(Vec::new)
-            .push(callback);
-    }
+
 
     fn record_change(alloc_id: u128, original: Vec<u8>, modified: Vec<u8>) {
         if let Some(recorder) = PROCESS_RECORDER.lock().unwrap().upgrade() {
@@ -304,18 +300,83 @@ impl<T: HasInner + HasAllocId + Clone> State<T> {
         self.object.lock().unwrap().clone_inner()
     }
 
-    pub fn set_value(&mut self, value: T::Inner) {
+    pub fn set_value(&mut self, value: T::Inner)
+    where
+        T::Inner: Send + 'static,
+    {
         let len = self.original_data.len();
+        let old_alloc_id = self.alloc_id;
         let mut lock = self.object.lock().unwrap();
-        // set_inner mutates in-place (clone_from), so the pointer stays valid.
-        let (original, modified) = unsafe {
-            let ptr = STATE_POINTERS.lock().unwrap()[&self.alloc_id];
-            let original = slice::from_raw_parts(ptr as *const u8, len).to_vec();
-            lock.set_inner(value);
-            let modified = slice::from_raw_parts(ptr as *const u8, len).to_vec();
-            (original, modified)
+
+        // Capture original bytes before mutation.
+        let original = unsafe {
+            let ptr = STATE_POINTERS.lock().unwrap()[&old_alloc_id];
+            slice::from_raw_parts(ptr as *const u8, len).to_vec()
         };
-        Self::record_change(self.alloc_id, original, modified);
+
+        // set_inner may reallocate (e.g. String does realloc+free),
+        // so the alloc_id and pointer can change.
+        lock.set_inner(value);
+
+        // Re-read the (possibly new) alloc_id after set_inner.
+        let new_alloc_id = lock.alloc_id();
+        let new_ptr = alloc::map_id(&new_alloc_id).unwrap() as *const u8;
+        let new_len = alloc::len(&new_alloc_id).unwrap() as usize;
+
+        let modified = unsafe { slice::from_raw_parts(new_ptr, new_len).to_vec() };
+
+        let inner = lock.clone_inner();
+        drop(lock);
+
+        // Update tracked pointer.
+        STATE_POINTERS
+            .lock()
+            .unwrap()
+            .insert(new_alloc_id, new_ptr as usize);
+        self.alloc_id = new_alloc_id;
+
+        Self::record_change(old_alloc_id, original, modified);
+
+        // Move callbacks if alloc ID changed.
+        let mut callbacks = ALLOCATION_CALLBACKS.lock().unwrap();
+        if old_alloc_id != new_alloc_id {
+            let old_callbacks = callbacks.remove(&old_alloc_id);
+            if let Some(cbs) = old_callbacks {
+                callbacks.insert(new_alloc_id, cbs);
+            }
+        }
+
+        if let Some(recorder) = PROCESS_RECORDER.lock().unwrap().upgrade() {
+            let mut rec_lock = recorder.lock().unwrap();
+            let updates = rec_lock.updates.remove(&old_alloc_id).unwrap_or_default();
+            rec_lock.updates.insert(new_alloc_id, updates);
+        }
+
+        let listeners = callbacks.get(&new_alloc_id).cloned().unwrap_or_default();
+        drop(callbacks);
+
+        for listener in listeners {
+            listener.0.lock().unwrap()(&inner as &dyn std::any::Any);
+        }
+    }
+
+    /// Adds a callback that will be invoked whenever `set` or `set_value` is called,
+    /// receiving a reference to the new inner value.
+    pub fn add_listener_callback(&self, mut callback: impl FnMut(&T::Inner) + Send + 'static)
+    where
+        T::Inner: Send + 'static,
+    {
+        let callback = Callback(Arc::new(Mutex::new(move |val: &dyn std::any::Any| {
+            if let Some(inner) = val.downcast_ref::<T::Inner>() {
+                callback(inner);
+            }
+        })));
+        ALLOCATION_CALLBACKS
+            .lock()
+            .unwrap()
+            .entry(self.alloc_id)
+            .or_insert_with(Vec::new)
+            .push(callback);
     }
 }
 
@@ -336,7 +397,6 @@ impl<T: HasInner + HasAllocId + Clone> From<T> for State<T> {
         Self::new(value).unwrap()
     }
 }
-
 
 impl<T: HasAllocId + Clone> PartialEq for State<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -394,6 +454,19 @@ impl<T> Drop for WatchGuard<T> {
                 .queue_sender
                 .send(snapshot)
                 .unwrap();
+        }
+
+        if self.modified_data.is_some() {
+            let listeners = ALLOCATION_CALLBACKS
+                .lock()
+                .unwrap()
+                .get(&self.alloc_id)
+                .cloned()
+                .unwrap_or_default();
+
+            for listener in listeners {
+                listener.0.lock().unwrap()(&() as &dyn std::any::Any);
+            }
         }
     }
 }
@@ -462,7 +535,7 @@ fn state_callback_test() {
 
             let changed = Arc::new(AtomicBool::new(false));
             let changed_clone = Arc::clone(&changed);
-            state.add_listener_callback(move || {
+            state.add_listener_callback(move |_| {
                 changed_clone.store(true, std::sync::atomic::Ordering::Relaxed);
             });
 
@@ -488,7 +561,7 @@ fn test_callback_moving_logic() {
 
     let called = Arc::new(AtomicBool::new(false));
     let called_clone = Arc::clone(&called);
-    let cb = Callback(Arc::new(Mutex::new(move || {
+    let cb = Callback(Arc::new(Mutex::new(move |_: &dyn std::any::Any| {
         called_clone.store(true, Ordering::Relaxed);
     })));
 
@@ -498,7 +571,7 @@ fn test_callback_moving_logic() {
     // Register a stale callback on the new ID that should be cleared
     let stale_called = Arc::new(AtomicBool::new(false));
     let stale_called_clone = Arc::clone(&stale_called);
-    let stale_cb = Callback(Arc::new(Mutex::new(move || {
+    let stale_cb = Callback(Arc::new(Mutex::new(move |_: &dyn std::any::Any| {
         stale_called_clone.store(true, Ordering::Relaxed);
     })));
     callbacks.insert(new_id, vec![stale_cb]);
@@ -514,7 +587,7 @@ fn test_callback_moving_logic() {
     }
 
     for listener in callbacks.get(&new_id).unwrap() {
-        listener.0.lock().unwrap()();
+        listener.0.lock().unwrap()(&() as &dyn std::any::Any);
     }
 
     assert!(called.load(Ordering::Relaxed));
