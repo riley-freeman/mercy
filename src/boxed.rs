@@ -22,11 +22,16 @@ impl<T> Drop for Box<T> {
 impl<T> Box<T> {
     pub fn new(allocator: &mut dyn Allocator, val: T) -> Result<Box<T>, Error> {
         let size = mem::size_of::<T>() as _;
+        let type_name = std::any::type_name::<T>();
         let id = allocator.alloc(size)?;
+        
+        println!("[DEBUG] [Box::new] ID: {}, Size: {}, Type: {}", id, size, type_name);
+        let ptr = allocator.map_id(id).unwrap();
+        println!("[DEBUG] [Box::new] Pointer mapped: {:?}", ptr);
 
-        // Copy the memory into the block
-        let rf = unsafe { &mut *(allocator.map_id(id).unwrap() as *mut T) };
-        *rf = val;
+        // Safely write to uninitialized memory without dropping old garbage
+        unsafe { std::ptr::write(ptr as *mut T, val) };
+        println!("[DEBUG] [Box::new] Wrote val!");
 
         Ok(Box::<T> {
             id,
@@ -70,11 +75,24 @@ impl<T> AsMut<T> for Box<T> {
 
 impl<T: Clone> Clone for Box<T> {
     fn clone(&self) -> Self {
-        let new_id = alloc::realloc(&self.id, mem::size_of::<T>() as _).unwrap();
-        let new_ref: *mut T = unsafe { &mut *(alloc::map_id(&new_id).unwrap() as *mut T) };
-
-        let old_ref = unsafe { &*(alloc::map_id(&self.id).unwrap() as *const T) };
-        unsafe { *new_ref = old_ref.clone() };
+        let size = mem::size_of::<T>() as _;
+        let type_name = std::any::type_name::<T>();
+        println!("[DEBUG] [Box::clone] Reallocating ID from {}, Size: {}, Type: {}", self.id, size, type_name);
+        
+        let new_id = alloc::realloc(&self.id, size).unwrap();
+        
+        println!("[DEBUG] [Box::clone] Mapping new ID: {}", new_id);
+        let new_ptr = alloc::map_id(&new_id).unwrap() as *mut T;
+        
+        println!("[DEBUG] [Box::clone] Mapping old ID: {}", self.id);
+        let old_ptr = alloc::map_id(&self.id).unwrap() as *const T;
+        
+        println!("[DEBUG] [Box::clone] Calling clone on old_ref");
+        let cloned_val = unsafe { &*old_ptr }.clone();
+        
+        println!("[DEBUG] [Box::clone] Writing to new_ref");
+        unsafe { std::ptr::write(new_ptr, cloned_val) };
+        println!("[DEBUG] [Box::clone] Finished write!");
 
         Box::<T> {
             id: new_id,

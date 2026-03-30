@@ -337,12 +337,6 @@ impl<T: HasInner + HasAllocId + Clone> From<T> for State<T> {
     }
 }
 
-impl<T: HasAllocId + Clone> AsRef<T> for State<T> {
-    fn as_ref(&self) -> &T {
-        let ptr = STATE_POINTERS.lock().unwrap()[&self.alloc_id];
-        unsafe { &*(ptr as *const T) }
-    }
-}
 
 impl<T: HasAllocId + Clone> PartialEq for State<T> {
     fn eq(&self, other: &Self) -> bool {

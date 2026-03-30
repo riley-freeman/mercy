@@ -18,6 +18,7 @@ pub struct UnixMapping {
 
 pub fn new_mapping(id: &str, size: usize) -> Result<UnixMapping, Error> {
     let os_id = format!("/{}", id); // shm_open requires a leading slash
+    let os_id_c = std::ffi::CString::new(os_id.clone()).unwrap();
     debug!("MERCY: attempting to create new shared memory with id: {}", id);
 
     // Size must be greater than 0
@@ -28,7 +29,7 @@ pub fn new_mapping(id: &str, size: usize) -> Result<UnixMapping, Error> {
     // TODO: Check if id is too long
     println!("OS ID: {}", id);
     let fd = unsafe { conv_unix_code(libc::shm_open(
-        os_id.as_ptr() as *const i8,
+        os_id_c.as_ptr(),
         libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,    // EXCL means fail if it already exists
         0o600                                           // allow user read/write
     ), id) }?;
@@ -41,25 +42,30 @@ pub fn new_mapping(id: &str, size: usize) -> Result<UnixMapping, Error> {
     // Actual question btw, how much do address spaces cost? like without them how much faster
     // would everything be?
     debug!("MERCY: mapping shared memory segment into process's address space");
-    let ptr = unsafe { conv_unix_code(libc::mmap(
+    let ptr_raw = unsafe { libc::mmap(
         std::ptr::null_mut(),
         size,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_SHARED,
         fd,
         0
-    ) as usize, id) }? as _;  // Conversion hell?
+    ) };
+    if ptr_raw == libc::MAP_FAILED {
+        return Err(Error::MiscellaneousOSError { code: errno::errno().0 });
+    }
+    let ptr = ptr_raw as usize;
 
     Ok(UnixMapping {  ptr, size, fd, os_id, owned: true })
 }
 
 pub fn open_mapping(id: &str) -> Result<UnixMapping, Error> {
     let os_id = format!("/{}", id); // shm_open requires a leading slash
+    let os_id_c = std::ffi::CString::new(os_id.clone()).unwrap();
 
     // Opening a shared memory fd
     debug!("MERCY: attempting to open shared memory with ID: {}", id);
     let fd = unsafe { conv_unix_code(libc::shm_open(
-        os_id.as_ptr() as *const i8,
+        os_id_c.as_ptr(),
         libc::O_RDWR,
         0o600
     ), id) }?;
@@ -77,14 +83,18 @@ pub fn open_mapping(id: &str) -> Result<UnixMapping, Error> {
     }
 
     // Map the memroy into our process's address space
-    let ptr = unsafe { conv_unix_code(libc::mmap(
+    let ptr_raw = unsafe { libc::mmap(
         std::ptr::null_mut(),
         size,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_SHARED,
         fd,
         0
-    ) as usize, id) }? as usize;
+    ) };
+    if ptr_raw == libc::MAP_FAILED {
+        return Err(Error::MiscellaneousOSError { code: errno::errno().0 });
+    }
+    let ptr = ptr_raw as usize;
 
     Ok(UnixMapping { ptr, size, fd, os_id, owned: false })
 }
@@ -120,7 +130,8 @@ impl Drop for UnixMapping {
         // We don't want to unlink the segment if we're panicking, because that would
         // cause the segment to be deleted. We could possibly recover some data.
         if !std::thread::panicking() && self.owned {
-            if (unsafe { libc::shm_unlink(self.os_id.as_ptr() as _) }) != 0 {
+            let os_id_c = std::ffi::CString::new(self.os_id.clone()).unwrap();
+            if (unsafe { libc::shm_unlink(os_id_c.as_ptr()) }) != 0 {
                 debug!("MERCY: failed to unlink shared memory segment: {:?}", self.fd);     // We_care_but_honestly_can't_do_anything
                                                                                             // Underscored_because_by_IDE_automatically
                                                                                             // makes_new_lines_and_i'm_too_lazy_to_figure
