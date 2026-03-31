@@ -1,7 +1,7 @@
 use syn::token::Super;
 
 use super::context;
-use crate::error::Error;
+use crate::{error::Error, sync::Mutex};
 
 pub trait Allocator {
     fn alloc(&mut self, size: u32) -> Result<u128, Error>;
@@ -148,9 +148,7 @@ fn the_realloc_test() {
     println!("Creating context with family ID: {}", id);
     tracing::debug!("Creating context with family ID: {}", id);
     ContextBuilder::new(&id)
-        .main(|res| {
-            let mut context = res.unwrap();
-
+        .main(|mut context| {
             // Allocate a buffer
             let one = context.alloc(64).unwrap();
             let two = realloc(&one, 64).unwrap();

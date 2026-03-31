@@ -52,6 +52,9 @@ pub enum Error {
         io_error: std::io::Error,
     },
 
+    WorkerStartupTimeout,
+    WorkerStateTimeout,
+
     #[cfg(target_os = "linux")]
     ShmemError {
         shmem_error: shared_memory::ShmemError,
@@ -108,6 +111,8 @@ impl std::fmt::Display for Error {
             Error::CannotSendWorkerMessage { io_error } => {
                 write!(f, "Failed to send worker message: {}", io_error)
             }
+            Error::WorkerStartupTimeout => write!(f, "Worker startup timed out"),
+            Error::WorkerStateTimeout => write!(f, "Worker state retrieval timed out"),
 
             #[cfg(target_os = "linux")]
             Error::ShmemError { shmem_error } => write!(f, "Shmem error: {}", shmem_error),

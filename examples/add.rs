@@ -22,8 +22,7 @@ fn ask(prompt: &str) -> i64 {
 
 fn main() {
     ContextBuilder::new("com.example.add")
-        .main(|ctx| {
-            let mut ctx = ctx.unwrap();
+        .main(|mut ctx| {
             let (a, b) = (ask("A"), ask("B"));
             let (tx, rx) = std::sync::mpsc::channel();
 
@@ -38,9 +37,9 @@ fn main() {
             println!("[main] {a} + {b} = {res}");
             ctx.close();
         })
-        .add_role("calculator", |ctx| {
+        .add_role("calculator", |mut ctx| {
             let (tx, rx) = std::sync::mpsc::channel();
-            ctx.unwrap().set_message_callback(move |v| {
+            ctx.set_message_callback(move |v| {
                 let p: Payload = v.deserialize_into().unwrap();
                 tx.send(()).unwrap();
                 Some(serde_value::Value::I64(p.a + p.b))

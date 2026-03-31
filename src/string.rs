@@ -210,8 +210,7 @@ fn the_string_test() {
     println!("Opening context with id: {}", id);
     tracing::debug!("Opening context with id: {}", id);
     ContextBuilder::new(&id)
-        .main(|res| {
-            let mut context = res.unwrap();
+        .main(|mut context| {
             let mut string = context.new_string("Hello, World").unwrap();
             assert_eq!(string.as_ref(), "Hello, World");
 
@@ -246,8 +245,7 @@ fn the_extend_test() {
     println!("Opening context with id: {}", id);
     tracing::debug!("Opening context with id: {}", id);
     ContextBuilder::new(&id)
-        .main(|res| {
-            let mut context = res.unwrap();
+        .main(|mut context| {
             let mut string = context.new_string("").unwrap();
 
             let chars = ['A', 'B', 'C'];

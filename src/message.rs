@@ -1,3 +1,4 @@
+use libc::{__SIZEOF_PTHREAD_MUTEX_T, pthread_mutex_t};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7,9 +8,16 @@ pub enum MessageType {
     MapId,
     Exit,
     Shutdown,
+
     NewWorker,
     SendWorker,
     ResponseWorker,
+
+    NewMutex,
+    GetPlatformMutex,
+
+    SetWorkerState,
+    GetWorkerState,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,4 +99,42 @@ pub struct SendWorkerReply {
 pub struct RecvWorkerMessage<T> {
     pub worker_id: u64,
     pub message_data: T,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NewMutexData {}
+
+#[cfg(target_family = "unix")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NewMutexReply {
+    pub pthread_mutex: Vec<u8>,
+    pub mutex_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetPlatformMutex {
+    pub mutex_id: u64,
+}
+
+#[cfg(target_family = "unix")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetPlatformMutexReply {
+    pub pthread_mutex: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetWorkerStateData {
+    pub state_id_high: u64,
+    pub state_id_low: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetWorkerStateData {
+    pub worker_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetWorkerStateReply {
+    pub state_id_high: Option<u64>,
+    pub state_id_low: Option<u64>,
 }

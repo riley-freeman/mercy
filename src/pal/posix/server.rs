@@ -12,21 +12,45 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    message::{GetPlatformMutex, GetPlatformMutexReply},
+    sync::ArcReferenceCounts,
+};
+
+use libc::{
+    PTHREAD_PROCESS_SHARED, key_t, pthread_mutex_init, pthread_mutex_t, pthread_mutexattr_init,
+    pthread_mutexattr_setpshared, pthread_mutexattr_t,
+};
 use serde_json::Value;
 use shared_memory::{Shmem, ShmemConf};
+
+struct SendShmem(Shmem);
+unsafe impl Send for SendShmem {}
 
 use crate::{
     error::Error,
     message::{
-        AllocData, AllocReply, FreeData, MapIdData, Message, MessageType, NewWorkerData,
-        NewWorkerReply, SendWorkerMessage, SendWorkerReply,
+        AllocData, AllocReply, FreeData, GetWorkerStateData, GetWorkerStateReply, MapIdData,
+        Message, MessageType, NewMutexData, NewMutexReply, NewWorkerData, NewWorkerReply,
+        SendWorkerMessage, SendWorkerReply, SetWorkerStateData,
     },
-    pal::posix::{MapIdReply, new_unix_socket_path},
+    pal::posix::{MapIdReply, new_unix_socket_path, worker::WorkerInfo},
 };
 use std::process::Command;
 
-static WORKERS: LazyLock<Mutex<HashMap<u64, UnixStream>>> =
+static WORKERS: LazyLock<Mutex<HashMap<u64, WorkerInfo>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static ALLOCATIONS: LazyLock<Mutex<HashMap<u16, (String, SendShmem)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static MUTEXES: LazyLock<Mutex<HashMap<u64, pthread_mutex_t>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static AVAILABLE_BLOCKS: LazyLock<Mutex<LinkedList<u16>>> =
+    LazyLock::new(|| Mutex::new(LinkedList::new()));
+
+static NEXT_BLOCK_ID: LazyLock<Mutex<u16>> = LazyLock::new(|| Mutex::new(0));
 
 pub fn start_server(family_id: &str) -> Result<(), Error> {
     let socket_path =
@@ -75,7 +99,7 @@ pub fn start_server(family_id: &str) -> Result<(), Error> {
                 WORKERS
                     .lock()
                     .unwrap()
-                    .insert(worker_id, stream.try_clone().unwrap());
+                    .insert(worker_id, WorkerInfo::new(stream.try_clone().unwrap()));
 
                 // Create a new thread to handle this client's messages.
                 let family_id_clone = String::from(family_id);
@@ -84,6 +108,7 @@ pub fn start_server(family_id: &str) -> Result<(), Error> {
                 let thread = std::thread::spawn(move || {
                     handle_client_messages(
                         stream,
+                        worker_id,
                         &family_id_clone,
                         is_running_clone,
                         socket_path_clone,
@@ -110,23 +135,23 @@ pub fn start_server(family_id: &str) -> Result<(), Error> {
 
 fn handle_client_messages(
     mut stream: UnixStream,
+    worker_id: u64,
     client_id: &str,
     is_running: Arc<AtomicBool>,
     socket_path: String,
 ) {
     let mut buffer = [0; 1024];
-    let mut allocations = HashMap::new();
-
-    let mut next_block_id = 0;
-    let mut available_blocks = LinkedList::new();
-
     let mut pending = String::new();
 
     loop {
         let bytes_read = stream.read(&mut buffer).unwrap_or(0);
         if bytes_read == 0 {
             // We want to quit this thread because the connection terminated.
-            allocations.clear();
+            if let Some(worker) = WORKERS.lock().unwrap().remove(&worker_id) {
+                if let Some(state_id) = worker.state {
+                    decrement_rc(state_id);
+                }
+            }
             break;
         }
 
@@ -149,22 +174,13 @@ fn handle_client_messages(
                     client_id,
                     serde_json::from_value(value).unwrap(),
                     &mut stream,
-                    &mut next_block_id,
-                    &mut available_blocks,
-                    &mut allocations,
                 ),
 
-                "Free" => handle_free_message(
-                    serde_json::from_value(value).unwrap(),
-                    &mut allocations,
-                    &mut available_blocks,
-                ),
+                "Free" => handle_free_message(serde_json::from_value(value).unwrap()),
 
-                "MapId" => handle_map_id_message(
-                    serde_json::from_value(value).unwrap(),
-                    &mut stream,
-                    &mut allocations,
-                ),
+                "MapId" => {
+                    handle_map_id_message(serde_json::from_value(value).unwrap(), &mut stream)
+                }
 
                 "Shutdown" => {
                     // set running to false and start a dummy connection
@@ -186,6 +202,24 @@ fn handle_client_messages(
                     &mut stream,
                 ),
 
+                "SetWorkerState" => handle_set_worker_state(
+                    worker_id,
+                    serde_json::from_value(value).unwrap(),
+                    &mut stream,
+                ),
+
+                "GetWorkerState" => {
+                    handle_get_worker_state(serde_json::from_value(value).unwrap(), &mut stream)
+                }
+
+                "NewMutex" => {
+                    handle_new_mutex_message(serde_json::from_value(value).unwrap(), &mut stream)
+                }
+                "GetPlatformMutex" => handle_get_platform_mutex_message(
+                    serde_json::from_value(value).unwrap(),
+                    &mut stream,
+                ),
+
                 _ => Err(Error::UnexpectedMessageType {
                     message_type: message_type.to_string(),
                 }),
@@ -195,14 +229,45 @@ fn handle_client_messages(
     }
 }
 
+fn decrement_rc(alloc_id: u128) {
+    let mut allocations = ALLOCATIONS.lock().unwrap();
+    let mut available_blocks = AVAILABLE_BLOCKS.lock().unwrap();
+    if alloc_id == 0 {
+        return;
+    }
+
+    let block_id = (alloc_id >> 16) as u16;
+    if let Some((_, shmem)) = allocations.get(&block_id) {
+        let rcs = unsafe { &mut *(shmem.0.as_ptr() as *mut ArcReferenceCounts) };
+        let prev = rcs.count.fetch_sub(1, Ordering::AcqRel);
+
+        if prev <= 1 {
+            // Strong count hit zero, free the data block and this RCS block
+            let data_id = rcs.data_id;
+
+            // 1. Free the data block
+            let data_block_id = (data_id >> 16) as u16;
+            if let Some(_) = allocations.remove(&data_block_id) {
+                available_blocks.push_back(data_block_id);
+            }
+
+            // 2. Free the RCS block if no weaks
+            if rcs.weaks.load(Ordering::Acquire) <= 0 {
+                allocations.remove(&block_id);
+                available_blocks.push_back(block_id);
+            }
+        }
+    }
+}
+
 fn handle_alloc_message(
     family_id: &str,
     message: Message<AllocData>,
     stream: &mut UnixStream,
-    next_block_id: &mut u16,
-    available_blocks: &mut LinkedList<u16>,
-    allocations: &mut HashMap<u16, (String, Shmem)>,
 ) -> Result<(), Error> {
+    let mut allocations = ALLOCATIONS.lock().unwrap();
+    let mut available_blocks = AVAILABLE_BLOCKS.lock().unwrap();
+    let mut next_block_id = NEXT_BLOCK_ID.lock().unwrap();
     println!("[DEBUG] [posix] [server] Handling alloc message");
     println!("[DEBUG] [posix] [server] Allocating block_id.");
 
@@ -241,7 +306,7 @@ fn handle_alloc_message(
 
     let alloc_id = (family_id_hash as u128) << 64 | (size as u128) << 32 | (block_id as u128) << 16;
 
-    allocations.insert(block_id, (os_id, shmem));
+    allocations.insert(block_id, (os_id, SendShmem(shmem)));
 
     let reply = Message::with_reply(
         message.id,
@@ -260,11 +325,9 @@ fn handle_alloc_message(
     Ok(())
 }
 
-fn handle_free_message(
-    message: Message<FreeData>,
-    allocations: &mut HashMap<u16, (String, Shmem)>,
-    available_blocks: &mut LinkedList<u16>,
-) -> Result<(), Error> {
+fn handle_free_message(message: Message<FreeData>) -> Result<(), Error> {
+    let mut allocations = ALLOCATIONS.lock().unwrap();
+    let mut available_blocks = AVAILABLE_BLOCKS.lock().unwrap();
     let block_id = (message.message_data.alloc_id_low >> 16) as u16;
     allocations.remove(&block_id);
     available_blocks.push_back(block_id);
@@ -275,8 +338,8 @@ fn handle_free_message(
 fn handle_map_id_message(
     message: Message<MapIdData>,
     stream: &mut UnixStream,
-    allocations: &HashMap<u16, (String, Shmem)>,
 ) -> Result<(), Error> {
+    let allocations = ALLOCATIONS.lock().unwrap();
     let alloc_id = (message.message_data.alloc_id_high as u128) << 64
         | message.message_data.alloc_id_low as u128;
     let block_id = (alloc_id >> 16) as u16;
@@ -340,10 +403,10 @@ fn handle_send_worker_message(
         message_data: message.message_data.message_data,
     };
 
-    if let Some(mut worker) = WORKERS.lock().unwrap().get(&worker_id) {
+    if let Some(worker) = WORKERS.lock().unwrap().get(&worker_id) {
         let mut msg_str = serde_json::to_string(&forwarded_message).unwrap();
         msg_str.push('\n');
-        let _ = worker.write_all(msg_str.as_bytes());
+        let _ = worker.stream().write_all(msg_str.as_bytes());
     } else {
         eprintln!("[ERROR] [posix] [server] Worker not found: {}", worker_id);
     }
@@ -365,9 +428,115 @@ fn handle_response_worker_message(
     msg_str.push('\n');
 
     let mut workers = WORKERS.lock().unwrap();
-    for (_, worker_stream) in workers.iter_mut() {
-        let _ = worker_stream.write_all(msg_str.as_bytes());
+    for (_, worker) in workers.iter_mut() {
+        let _ = worker.stream().write_all(msg_str.as_bytes());
     }
 
+    Ok(())
+}
+
+fn handle_new_mutex_message(
+    message: Message<NewMutexData>,
+    stream: &mut UnixStream,
+) -> Result<(), Error> {
+    static NEXT_MUTEX_ID: AtomicU64 = AtomicU64::new(1);
+
+    let mutex = unsafe {
+        let mut attr = std::mem::MaybeUninit::<pthread_mutexattr_t>::uninit();
+        pthread_mutexattr_init(attr.as_mut_ptr());
+        pthread_mutexattr_setpshared(attr.as_mut_ptr(), PTHREAD_PROCESS_SHARED);
+
+        let mut mutex = std::mem::MaybeUninit::<pthread_mutex_t>::uninit();
+        pthread_mutex_init(mutex.as_mut_ptr(), attr.as_ptr());
+        mutex.assume_init()
+    };
+
+    let mut mutex_bytes = vec![0u8; std::mem::size_of::<pthread_mutex_t>()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &mutex as *const _ as *const u8,
+            mutex_bytes.as_mut_ptr(),
+            mutex_bytes.len(),
+        );
+    }
+
+    let data = NewMutexReply {
+        pthread_mutex: mutex_bytes,
+        mutex_id: NEXT_MUTEX_ID.fetch_add(1, Ordering::AcqRel),
+    };
+
+    MUTEXES.lock().unwrap().insert(data.mutex_id, mutex);
+
+    let reply = Message::with_reply(message.id, message.id, MessageType::NewMutex, data);
+    let mut bytes = serde_json::to_vec(&reply).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).unwrap();
+    Ok(())
+}
+
+fn handle_get_platform_mutex_message(
+    message: Message<GetPlatformMutex>,
+    stream: &mut UnixStream,
+) -> Result<(), Error> {
+    let mutex_id = message.message_data.mutex_id;
+    let mutex = MUTEXES.lock().unwrap().get(&mutex_id).unwrap().clone();
+    let mut mutex_bytes = vec![0u8; std::mem::size_of::<pthread_mutex_t>()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &mutex as *const _ as *const u8,
+            mutex_bytes.as_mut_ptr(),
+            mutex_bytes.len(),
+        );
+    }
+
+    let data = GetPlatformMutexReply {
+        pthread_mutex: mutex_bytes,
+    };
+    let reply = Message::with_reply(message.id, message.id, MessageType::GetPlatformMutex, data);
+    let mut bytes = serde_json::to_vec(&reply).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).unwrap();
+    Ok(())
+}
+
+fn handle_set_worker_state(
+    worker_id: u64,
+    message: Message<SetWorkerStateData>,
+    _stream: &mut UnixStream,
+) -> Result<(), Error> {
+    let mut workers = WORKERS.lock().unwrap();
+    if let Some(worker) = workers.get_mut(&worker_id) {
+        let state_id = (message.message_data.state_id_high as u128) << 64
+            | (message.message_data.state_id_low as u128);
+        let old_state = worker.state.replace(state_id);
+        if let Some(old_state_id) = old_state {
+            decrement_rc(old_state_id);
+        }
+    }
+    Ok(())
+}
+
+fn handle_get_worker_state(
+    message: Message<GetWorkerStateData>,
+    stream: &mut UnixStream,
+) -> Result<(), Error> {
+    let workers = WORKERS.lock().unwrap();
+    let state_id = workers
+        .get(&message.message_data.worker_id)
+        .and_then(|w| w.state);
+
+    let reply = Message::with_reply(
+        message.id,
+        message.id,
+        MessageType::GetWorkerState,
+        GetWorkerStateReply {
+            state_id_high: state_id.map(|id| (id >> 64) as u64),
+            state_id_low: state_id.map(|id| id as u64),
+        },
+    );
+
+    let mut bytes = serde_json::to_vec(&reply).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).unwrap();
     Ok(())
 }

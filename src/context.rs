@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, MutexGuard};
 use std::{collections, sync::LazyLock};
 
+use crate::alloc::HasAllocId;
 use crate::pal::DispatchContext;
 #[cfg(target_os = "macos")]
 use crate::pal::apple::AppleContext;
@@ -12,6 +13,7 @@ use crate::pal::apple::AppleContext;
 use crate::pal::apple::AppleContext;
 #[cfg(target_os = "linux")]
 use crate::pal::posix::PosixContext;
+use crate::sync::Arc;
 use crate::worker::Worker;
 
 use super::error;
@@ -25,7 +27,7 @@ pub static MANAGER_CONTEXT: LazyLock<std::sync::Mutex<Option<Context>>> =
 
 pub struct ContextBuilder {
     id: String,
-    roles: HashMap<String, Box<dyn FnOnce(Result<Context, error::Error>) -> ()>>,
+    roles: HashMap<String, Box<dyn FnOnce(Context) -> ()>>,
 }
 
 impl std::fmt::Debug for ContextBuilder {
@@ -50,19 +52,12 @@ impl ContextBuilder {
         self
     }
 
-    pub fn main(
-        mut self,
-        main: impl FnOnce(Result<Context, error::Error>) -> () + 'static,
-    ) -> Self {
+    pub fn main(mut self, main: impl FnOnce(Context) -> () + 'static) -> Self {
         self.roles.insert("main".to_string(), Box::new(main));
         self
     }
 
-    pub fn add_role(
-        mut self,
-        role: &str,
-        main: impl FnOnce(Result<Context, error::Error>) -> () + 'static,
-    ) -> Self {
+    pub fn add_role(mut self, role: &str, main: impl FnOnce(Context) -> () + 'static) -> Self {
         if role.eq("main") || role.eq("manager") {
             panic!(
                 "{}",
@@ -93,12 +88,19 @@ impl ContextBuilder {
                 ContextInner::open(&self.id, take_ownership)
             }
             Err(e) => Err(e),
-        };
+        }
+        .expect(&format!("Failed to create context"));
 
         let role = self
             .roles
             .remove(&role_name)
             .expect(&format!("Role {} not found", role_name));
+
+        {
+            let mut guard = MANAGER_CONTEXT.lock().unwrap();
+            *guard = Some(context);
+        }
+
         role(context);
         exit(0)
     }
@@ -136,9 +138,6 @@ impl ContextInner {
         // Add the context to the process contexts
         let mut guard = PROCESS_CONTEXTS.lock().unwrap();
         register_context(&mut guard, id_hash, inner);
-
-        let mut guard = MANAGER_CONTEXT.lock().unwrap();
-        *guard = Some(context);
 
         Ok(context)
     }
@@ -185,6 +184,15 @@ pub struct Context {
 }
 
 impl Context {
+    pub fn from_id(id_hash: u64) -> Option<Self> {
+        let guard = PROCESS_CONTEXTS.lock().unwrap();
+        if guard.contains_key(&(id_hash as usize)) {
+            Some(Context { id_hash })
+        } else {
+            None
+        }
+    }
+
     fn inner(&self) -> std::sync::Arc<std::sync::Mutex<ContextInner>> {
         let guard = PROCESS_CONTEXTS.lock().unwrap();
         guard
@@ -240,6 +248,42 @@ impl Context {
         callback: impl FnMut(serde_value::Value) -> Option<serde_value::Value> + Send + 'static,
     ) {
         *MESSAGE_CALLBACK.lock().unwrap() = Box::new(callback);
+    }
+
+    pub fn new_mutex<T>(&mut self, data: T) -> Result<crate::sync::Mutex<T>, error::Error> {
+        let mutex_id = self.inner().lock().unwrap().dispatch.mutex()?;
+        Ok(crate::sync::Mutex {
+            mutex_id,
+            context_id: self.id_hash,
+            data: std::cell::UnsafeCell::new(data),
+        })
+    }
+
+    pub fn expose_mutex(&mut self, mutex_id: u64) -> Result<(), error::Error> {
+        self.inner().lock().unwrap().dispatch.expose_mutex(mutex_id)
+    }
+
+    pub fn set_state<T: 'static>(
+        &mut self,
+        state: Arc<crate::sync::Mutex<T>>,
+    ) -> Result<(), error::Error> {
+        let allod_id = state.alloc_id();
+        self.inner()
+            .lock()
+            .unwrap()
+            .dispatch
+            .set_worker_state(allod_id)
+    }
+
+    pub fn get_worker_state<T: 'static>(&mut self, worker_id: u64) -> Option<Arc<T>> {
+        let id = self
+            .inner()
+            .lock()
+            .unwrap()
+            .dispatch
+            .get_worker_state(worker_id)
+            .ok()??;
+        Arc::from_id(id)
     }
 }
 

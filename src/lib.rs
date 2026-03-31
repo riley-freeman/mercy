@@ -85,8 +85,7 @@ mod tests {
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
         ContextBuilder::new(&id)
-            .main(|res| {
-                let mut context = res.unwrap();
+            .main(|mut context| {
                 let alloc_id_0 = context.alloc(1024).unwrap();
                 let alloc_id_1 = context.alloc(2048).unwrap();
                 let alloc_id_2 = context.alloc(4096).unwrap();
@@ -105,9 +104,7 @@ mod tests {
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
         ContextBuilder::new(&id)
-            .main(|res| {
-                let mut context = res.unwrap();
-
+            .main(|mut context| {
                 #[derive(Debug, Clone, PartialEq)]
                 #[allow(unused)]
                 struct Person {
@@ -138,9 +135,7 @@ mod tests {
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
         ContextBuilder::new(&id)
-            .main(|res| {
-                let mut context = res.unwrap();
-
+            .main(|mut context| {
                 let i = context.new_arc(u16::MAX).unwrap();
                 println!("Hello World: {}", &i);
 
@@ -172,8 +167,7 @@ mod tests {
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
         ContextBuilder::new(&id)
-            .main(|res| {
-                let mut context = res.unwrap();
+            .main(|mut context| {
                 let i = context.new_arc(u16::MAX).unwrap();
 
                 let weak = crate::sync::Arc::downgrade(&i).unwrap();

@@ -18,14 +18,19 @@ use crate::{
     alloc::Allocator,
     error::Error,
     message::{
-        AllocData, AllocReply, FreeData, MapIdData, Message, MessageType, NewWorkerData,
-        NewWorkerReply, SendWorkerMessage, SendWorkerReply,
+        AllocData, AllocReply, FreeData, GetPlatformMutex, GetPlatformMutexReply,
+        GetWorkerStateData, GetWorkerStateReply, MapIdData, Message, MessageType, NewMutexData,
+        NewMutexReply, NewWorkerData, NewWorkerReply, SendWorkerMessage, SendWorkerReply,
+        SetWorkerStateData,
     },
-    pal::DispatchContext,
+    pal::{DispatchContext, posix::mutex::PosixMutex},
+    sync::DISPATCH_MUTEXES,
     worker::Worker,
 };
 
+pub mod mutex;
 pub mod server;
+pub mod worker;
 
 #[derive(Derivative)]
 #[derivative(Debug)]
@@ -172,7 +177,7 @@ impl PosixContext {
             manager_child: None,
             hashed_family_id,
             worker_id,
-            reply_closures: Arc::new(Mutex::new(HashMap::new())),
+            reply_closures,
             shmems: HashMap::new(),
             owner: take_ownership,
         })
@@ -227,6 +232,7 @@ impl PosixContext {
 
         let msg = Message::new(id, message_type, data);
         let mut msg_str = serde_json::to_string(&msg).unwrap();
+        println!("[DEBUG] [posix] [client] Sending: {}", msg_str);
         msg_str.push('\n');
         self.manager_stream.write_all(msg_str.as_bytes())?;
 
@@ -235,37 +241,48 @@ impl PosixContext {
 
     fn handle_messages(
         worker_id: u64,
-        mut manager_stream: UnixStream,
+        mut stream: UnixStream,
         reply_closures: Arc<Mutex<HashMap<i64, Box<dyn FnOnce(String) + Send>>>>,
     ) {
-        let mut buffer = [0; 1024];
-        let mut pending = String::new();
+        let mut buffer = [0; 4096];
+        let mut pending = Vec::new();
         loop {
-            let length = manager_stream.read(&mut buffer).unwrap();
-            // If the manager stream is closed, break the loop.
-            if length == 0 {
+            let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+            if bytes_read == 0 {
                 break;
             }
 
-            pending.push_str(&String::from_utf8_lossy(&buffer[..length]));
+            pending.extend_from_slice(&buffer[..bytes_read]);
 
-            // Process all complete newline-delimited messages.
-            while let Some(newline_pos) = pending.find('\n') {
-                let line: String = pending.drain(..=newline_pos).collect();
+            while let Some(line_pos) = pending.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = pending.drain(..=line_pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
 
-                // Try to parse it as a reply to a manager action
-                if let Ok(msg) = serde_json::from_str::<Message<serde_json::Value>>(line) {
-                    if let Some(reply_id) = msg.reply_id {
-                        let mut reply_closures = reply_closures.lock().unwrap();
-                        if let Some(callback) = reply_closures.remove(&reply_id) {
-                            callback(line.to_string());
-                        }
+                let value_res: Result<serde_json::Value, _> = serde_json::from_str(line);
+                let value = match value_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "[ERROR] [posix] [client {}] JSON failure: {} on line: {}",
+                            worker_id, e, line
+                        );
                         continue;
                     }
+                };
+
+                let reply_id = value.get("reply_id").and_then(|v| v.as_i64());
+                let _message_id = value.get("id").and_then(|v| v.as_i64());
+
+                if let Some(reply_id) = reply_id {
+                    let mut guard = reply_closures.lock().unwrap();
+                    if let Some(closure) = guard.remove(&reply_id) {
+                        closure(line.to_string());
+                    }
+                    continue;
                 }
 
                 // If it wasn't a manager reply, it's a message sent to us
@@ -281,7 +298,7 @@ impl PosixContext {
                             Message::with_reply(msg.id, msg.id, MessageType::ResponseWorker, data);
                         let mut msg_str = serde_json::to_string(&msg).unwrap();
                         msg_str.push('\n');
-                        manager_stream.write_all(msg_str.as_bytes()).ok();
+                        stream.write_all(msg_str.as_bytes()).ok();
                     }
                 }
             }
@@ -313,7 +330,7 @@ impl DispatchContext for PosixContext {
             Ok(reply) => Ok(reply),
             Err(e) => {
                 println!("[DEBUG] [new_worker] [posix] err: {:?}", e);
-                return Err(crate::error::Error::OperationUnsupported);
+                return Err(crate::error::Error::WorkerStartupTimeout);
             }
         }
     }
@@ -342,6 +359,133 @@ impl DispatchContext for PosixContext {
         })?;
         Ok(())
     }
+    fn mutex(&mut self) -> Result<u64, Error> {
+        let data = NewMutexData {};
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Get the posix mutex and id from the server
+        self.send_wrapped_message::<NewMutexData, NewMutexReply, _>(
+            data,
+            MessageType::NewMutex,
+            move |msg, _| {
+                tx.send((msg.message_data.pthread_mutex, msg.message_data.mutex_id))
+                    .ok();
+            },
+        )
+        .map_err(|err| {
+            println!("[DEBUG] [mutex] [posix] err: {:?}", err);
+            crate::error::Error::OperationUnsupported
+        })?;
+
+        let (posix_mutex_bytes, mutex_id) = rx
+            .recv()
+            .map_err(|_| crate::error::Error::OperationUnsupported)?;
+
+        let posix_mutex: libc::pthread_mutex_t = unsafe {
+            let mut m = std::mem::MaybeUninit::<libc::pthread_mutex_t>::uninit();
+            std::ptr::copy_nonoverlapping(
+                posix_mutex_bytes.as_ptr(),
+                m.as_mut_ptr() as *mut u8,
+                std::mem::size_of::<libc::pthread_mutex_t>(),
+            );
+            m.assume_init()
+        };
+
+        // Create a set a dispatch mutex
+        DISPATCH_MUTEXES
+            .lock()
+            .unwrap()
+            .insert(mutex_id, Arc::new(PosixMutex { posix_mutex }));
+
+        Ok(mutex_id)
+    }
+
+    fn expose_mutex(&mut self, mutex_id: u64) -> Result<(), Error> {
+        let data = GetPlatformMutex { mutex_id };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send_wrapped_message::<GetPlatformMutex, GetPlatformMutexReply, _>(
+            data,
+            MessageType::GetPlatformMutex,
+            move |msg, _| {
+                tx.send(msg.message_data.pthread_mutex).ok();
+            },
+        )
+        .map_err(|err| {
+            println!("[DEBUG] [register_mutex] [posix] err: {:?}", err);
+            crate::error::Error::OperationUnsupported
+        })?;
+
+        let posix_mutex_bytes = rx
+            .recv()
+            .map_err(|_| crate::error::Error::OperationUnsupported)?;
+
+        let posix_mutex: libc::pthread_mutex_t = unsafe {
+            let mut m = std::mem::MaybeUninit::<libc::pthread_mutex_t>::uninit();
+            std::ptr::copy_nonoverlapping(
+                posix_mutex_bytes.as_ptr(),
+                m.as_mut_ptr() as *mut u8,
+                std::mem::size_of::<libc::pthread_mutex_t>(),
+            );
+            m.assume_init()
+        };
+
+        // Create a set a dispatch mutex
+        DISPATCH_MUTEXES
+            .lock()
+            .unwrap()
+            .insert(mutex_id, Arc::new(PosixMutex { posix_mutex }));
+        Ok(())
+    }
+
+    fn set_worker_state(&mut self, state_id: u128) -> Result<(), Error> {
+        let data = SetWorkerStateData {
+            state_id_high: (state_id >> 64) as u64,
+            state_id_low: state_id as u64,
+        };
+        self.send_wrapped_message::<SetWorkerStateData, (), _>(
+            data,
+            MessageType::SetWorkerState,
+            |_, _| {},
+        )
+        .map_err(|err| {
+            println!("[DEBUG] [set_worker_state] [posix] err: {:?}", err);
+            crate::error::Error::OperationUnsupported
+        })?;
+        Ok(())
+    }
+
+    fn get_worker_state(&mut self, worker_id: u64) -> Result<Option<u128>, Error> {
+        let data = GetWorkerStateData { worker_id };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send_wrapped_message::<GetWorkerStateData, GetWorkerStateReply, _>(
+            data,
+            MessageType::GetWorkerState,
+            move |msg, _| {
+                let state_id = match (
+                    msg.message_data.state_id_high,
+                    msg.message_data.state_id_low,
+                ) {
+                    (Some(high), Some(low)) => Some((high as u128) << 64 | (low as u128)),
+                    _ => None,
+                };
+                tx.send(state_id).ok();
+            },
+        )
+        .map_err(|err| {
+            println!("[DEBUG] [get_worker_state] [posix] err: {:?}", err);
+            crate::error::Error::OperationUnsupported
+        })?;
+
+        println!("[DEBUG] [get_worker_state] [posix] Waiting for reply...");
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(reply) => Ok(reply),
+            Err(e) => {
+                println!("[DEBUG] [get_worker_state] [posix] err: {:?}", e);
+                return Err(crate::error::Error::WorkerStateTimeout);
+            }
+        }
+    }
 }
 
 impl Allocator for PosixContext {
@@ -365,6 +509,8 @@ impl Allocator for PosixContext {
             println!("[DEBUG] [alloc] [posix] err: {:?}", err);
             crate::error::Error::OperationUnsupported
         })?;
+
+        println!("[DEBUG] [alloc] [posix] Waiting for reply...");
 
         let reply = match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(reply) => reply,

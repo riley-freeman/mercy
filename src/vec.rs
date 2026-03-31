@@ -201,8 +201,7 @@ mod tests {
         println!("Opening context with id: {}", id);
         tracing::debug!("Opening context with id: {}", id);
         ContextBuilder::new(&id)
-            .main(|res| {
-                let mut context = res.unwrap();
+            .main(|mut context| {
                 let mut vec = context.new_vec::<u32>().unwrap();
 
                 assert_eq!(vec.len(), 0);

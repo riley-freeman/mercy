@@ -1,14 +1,19 @@
 use std::any::{Any, TypeId};
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use std::mem;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicU32;
+use std::sync::LazyLock;
 
-use crate::alloc::{self, Allocator};
+use crate::alloc::{self, Allocator, HasAllocId};
+use crate::context::Context;
 use crate::error::Error;
 use crate::header::typeid_to_u64;
+use crate::pal::DispatchMutex;
 
 pub struct Arc<T: ?Sized> {
     data_id: u128,
@@ -18,9 +23,10 @@ pub struct Arc<T: ?Sized> {
 }
 
 // Atomic Reference Counting Reference Counts
-struct ArcReferenceCounts {
-    count: AtomicU32,
-    weaks: AtomicU32,
+pub(crate) struct ArcReferenceCounts {
+    pub(crate) count: AtomicU32,
+    pub(crate) weaks: AtomicU32,
+    pub(crate) data_id: u128,
 }
 
 impl<T: ?Sized> Drop for Arc<T> {
@@ -48,11 +54,27 @@ where
         *rcs = ArcReferenceCounts {
             count: AtomicU32::new(1),
             weaks: AtomicU32::new(0),
+            data_id,
         };
 
         Ok(Arc::<T> {
             data_id,
             rcs_id,
+            type_id: typeid_to_u64(TypeId::of::<T>()),
+            _phantom: PhantomData,
+        })
+    }
+
+    pub fn from_id(id: u128) -> Option<Arc<T>> {
+        let rcs_ptr = alloc::map_id(&id).ok()?;
+        let rcs = unsafe { &mut *(rcs_ptr as *mut ArcReferenceCounts) };
+
+        // Increment the strong count
+        rcs.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Some(Arc::<T> {
+            data_id: rcs.data_id,
+            rcs_id: id,
             type_id: typeid_to_u64(TypeId::of::<T>()),
             _phantom: PhantomData,
         })
@@ -102,6 +124,15 @@ impl<T: ?Sized> Arc<T> {
         }
 
         Ok(())
+    }
+}
+
+impl<T: ?Sized> HasAllocId for Arc<T> {
+    fn alloc_id(&self) -> u128 {
+        // Increment the strong count
+        unsafe { self.increment_strong_count_backend().unwrap() };
+
+        self.rcs_id
     }
 }
 
@@ -272,5 +303,85 @@ impl<T: ?Sized> Weak<T> {
         }
 
         Ok(())
+    }
+}
+
+pub static DISPATCH_MUTEXES: LazyLock<
+    std::sync::Mutex<HashMap<u64, std::sync::Arc<dyn DispatchMutex + Send + Sync>>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+pub struct Mutex<T> {
+    pub(crate) mutex_id: u64,
+    pub(crate) context_id: u64,
+    pub(crate) data: UnsafeCell<T>,
+}
+
+pub struct LockGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+    data: &'a mut T,
+}
+
+impl<T> Mutex<T> {
+    pub fn new(context: &mut Context, value: T) -> Self {
+        context.new_mutex(value).unwrap()
+    }
+
+    pub fn lock(&self) -> LockGuard<'_, T> {
+        let mut dispatch = {
+            let guard = DISPATCH_MUTEXES.lock().unwrap();
+            guard.get(&self.mutex_id).cloned()
+        };
+
+        if dispatch.is_none() {
+            let mut context = Context::from_id(self.context_id)
+                .expect("Mutex context not found in process registry");
+            println!(
+                "[DEBUG] [mutex] [dynamic] Exposing mutex {} from context {}",
+                self.mutex_id, self.context_id
+            );
+            context.expose_mutex(self.mutex_id).unwrap();
+
+            dispatch = {
+                let guard = DISPATCH_MUTEXES.lock().unwrap();
+                guard.get(&self.mutex_id).cloned()
+            };
+        }
+
+        let dispatch = dispatch.expect("Failed to expose mutex");
+        dispatch.lock();
+
+        // SAFETY: We have locked the mutex through dispatch
+        let data = unsafe { &mut *self.data.get() };
+        LockGuard {
+            mutex: self,
+            data,
+        }
+    }
+}
+
+impl<'a, T> Drop for LockGuard<'a, T> {
+    fn drop(&mut self) {
+        let dispatch = {
+            let guard = DISPATCH_MUTEXES.lock().unwrap();
+            guard
+                .get(&self.mutex.mutex_id)
+                .cloned()
+                .expect("Mutex lost from registry during lock")
+        };
+        dispatch.unlock();
+    }
+}
+
+impl<T> Deref for LockGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.data
+    }
+}
+
+impl<T> DerefMut for LockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.data
     }
 }

@@ -209,7 +209,10 @@ impl<T: HasAllocId + Clone> State<T> {
 
     /// Returns a `WatchGuard` that provides mutable access to the underlying data.
     /// When the `WatchGuard` is dropped, any modifications are sent to the recorder.
-    pub fn watch(&self) -> Result<WatchGuard<T>, Error> {
+    pub fn watch(&self) -> Result<WatchGuard<T>, Error>
+    where
+        T: HasInner,
+    {
         let lock = self.object.lock().unwrap();
         WatchGuard::new(lock.alloc_id())
     }
@@ -274,8 +277,6 @@ impl<T: HasAllocId + Clone> State<T> {
             listener.0.lock().unwrap()(&() as &dyn std::any::Any);
         }
     }
-
-
 
     fn record_change(alloc_id: u128, original: Vec<u8>, modified: Vec<u8>) {
         if let Some(recorder) = PROCESS_RECORDER.lock().unwrap().upgrade() {
@@ -406,7 +407,10 @@ impl<T: HasAllocId + Clone> PartialEq for State<T> {
 
 /// A scoped mutable reference to allocated data. When dropped, captures the
 /// current state of the data and sends it to the recorder for diff tracking.
-pub struct WatchGuard<T> {
+pub struct WatchGuard<T: HasInner>
+where
+    T::Inner: 'static,
+{
     _phantom: PhantomData<T>,
     alloc_id: u128,
     ptr: usize,
@@ -415,7 +419,10 @@ pub struct WatchGuard<T> {
     modified_data: Option<Vec<u8>>,
 }
 
-impl<T> WatchGuard<T> {
+impl<T: HasInner> WatchGuard<T>
+where
+    T::Inner: 'static,
+{
     pub fn new(alloc_id: u128) -> Result<WatchGuard<T>, Error> {
         let ptr = alloc::map_id(&alloc_id)? as *const u8;
         let len = alloc::len(&alloc_id)? as usize;
@@ -433,7 +440,10 @@ impl<T> WatchGuard<T> {
     }
 }
 
-impl<T> Drop for WatchGuard<T> {
+impl<T: HasInner> Drop for WatchGuard<T>
+where
+    T::Inner: 'static,
+{
     fn drop(&mut self) {
         if let Some(recorder) = PROCESS_RECORDER.lock().unwrap().upgrade() {
             let data = match &self.modified_data {
@@ -464,8 +474,10 @@ impl<T> Drop for WatchGuard<T> {
                 .cloned()
                 .unwrap_or_default();
 
+            let val = unsafe { &*(self.ptr as *const T::Inner) };
+
             for listener in listeners {
-                listener.0.lock().unwrap()(&() as &dyn std::any::Any);
+                listener.0.lock().unwrap()(val as &dyn std::any::Any);
             }
         }
     }
@@ -492,8 +504,7 @@ fn the_first_recording_test() {
 
     let id = String::from("crayon.mercy.test.rec");
     ContextBuilder::new(&id)
-        .main(|res| {
-            let mut context = res.unwrap();
+        .main(|mut context| {
             let mut recording = Recorder::new().unwrap();
             recording.begin_recording();
 
@@ -529,8 +540,7 @@ fn state_callback_test() {
 
     let id = String::from("crayon.mercy.test.rec.state_callback");
     ContextBuilder::new(&id)
-        .main(|res| {
-            let mut context = res.unwrap();
+        .main(|mut context| {
             let mut state = State::new(context.new_box(0x99_u8).unwrap()).unwrap();
 
             let changed = Arc::new(AtomicBool::new(false));
