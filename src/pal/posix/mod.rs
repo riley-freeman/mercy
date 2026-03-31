@@ -17,8 +17,12 @@ use shared_memory::{Shmem, ShmemConf};
 use crate::{
     alloc::Allocator,
     error::Error,
-    message::{AllocData, AllocReply, FreeData, MapIdData, Message, MessageType},
+    message::{
+        AllocData, AllocReply, FreeData, MapIdData, Message, MessageType, NewWorkerData,
+        NewWorkerReply, SendWorkerMessage, SendWorkerReply,
+    },
     pal::DispatchContext,
+    worker::Worker,
 };
 
 pub mod server;
@@ -31,6 +35,7 @@ pub struct PosixContext {
     manager_child: Option<std::process::Child>,
 
     hashed_family_id: u64,
+    worker_id: u64,
 
     #[derivative(Debug = "ignore")]
     reply_closures: Arc<Mutex<HashMap<i64, Box<dyn FnOnce(String) + Send>>>>,
@@ -51,7 +56,7 @@ impl Drop for PosixContext {
             // Send a shutdown message to the manager (best-effort; the
             // manager may already have exited, producing a BrokenPipe).
             // let _ = self.send_message::<(), (), _>((), MessageType::Shutdown, |_, _| {});
-            self.send_message::<(), (), _>((), MessageType::Shutdown, |_, _| {})
+            self.send_wrapped_message::<(), (), _>((), MessageType::Shutdown, |_, _| {})
                 .unwrap();
         }
     }
@@ -62,9 +67,20 @@ impl PosixContext {
         let socket_path = new_unix_socket_path(family_id);
         // Check if we already have a manager.
         if fs::exists(&socket_path).map_err(|e| Error::IoError { io_error: e })? {
-            return Err(Error::IdAlreadyExists {
-                id: String::from(family_id),
-            });
+            match UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    return Err(Error::IdAlreadyExists {
+                        id: String::from(family_id),
+                    });
+                }
+                Err(e) => {
+                    println!(
+                        "[DEBUG] [posix] broken manager found. removing socket file: {}",
+                        e
+                    );
+                    fs::remove_file(&socket_path).map_err(|e| Error::IoError { io_error: e })?;
+                }
+            }
         }
 
         let our_args = args().collect::<Vec<String>>();
@@ -86,7 +102,7 @@ impl PosixContext {
             .map_err(|e| Error::CannotStartProcess { io_error: e })?;
 
         // Connect to the manager, retrying if it's not ready yet.
-        let manager_stream = loop {
+        let mut manager_stream = loop {
             match UnixStream::connect(&socket_path) {
                 Ok(stream) => break stream,
                 Err(e) => {
@@ -101,14 +117,21 @@ impl PosixContext {
             }
         };
 
+        manager_stream
+            .write_all(&crate::context::Context::worker_id().to_ne_bytes())
+            .unwrap();
+
         let reply_closures = Arc::new(Mutex::new(HashMap::new()));
         let manager_thread = Self::start_manager_thread(&manager_stream, &reply_closures);
+
+        let worker_id = crate::context::Context::worker_id();
 
         Ok(Self {
             manager_stream,
             manager_thread,
             reply_closures,
             hashed_family_id,
+            worker_id,
             manager_child: Some(manager_child),
             shmems: HashMap::new(),
             owner: true,
@@ -132,16 +155,23 @@ impl PosixContext {
             }
         })?;
 
-        let manager_stream = manager_stream;
+        let mut manager_stream = manager_stream;
+        manager_stream
+            .write_all(&crate::context::Context::worker_id().to_ne_bytes())
+            .unwrap();
+
         let reply_closures = Arc::new(Mutex::new(HashMap::new()));
 
         let manager_thread = Self::start_manager_thread(&manager_stream, &reply_closures);
+
+        let worker_id = crate::context::Context::worker_id();
 
         Ok(Self {
             manager_stream,
             manager_thread,
             manager_child: None,
             hashed_family_id,
+            worker_id,
             reply_closures: Arc::new(Mutex::new(HashMap::new())),
             shmems: HashMap::new(),
             owner: take_ownership,
@@ -154,9 +184,10 @@ impl PosixContext {
     ) -> JoinHandle<()> {
         let stream_clone = stream.try_clone().unwrap();
         let reply_closures_clone = Arc::clone(reply_closures);
+        let worker_id = crate::context::Context::worker_id();
 
         std::thread::spawn(move || {
-            Self::handle_messages(stream_clone, reply_closures_clone);
+            Self::handle_messages(worker_id, stream_clone, reply_closures_clone);
         })
     }
 
@@ -171,7 +202,7 @@ impl PosixContext {
         id
     }
 
-    pub fn send_message<T, R, F>(
+    pub fn send_wrapped_message<T, R, F>(
         &mut self,
         data: T,
         message_type: MessageType,
@@ -186,11 +217,12 @@ impl PosixContext {
         let id = self.new_id(&mut guard);
         guard.insert(
             id,
-            Box::new(move |reply_str| {
-                if let Ok(msg) = serde_json::from_str::<Message<R>>(&reply_str) {
-                    callback(msg, reply_str.clone());
-                }
-            }),
+            Box::new(
+                move |reply_str| match serde_json::from_str::<Message<R>>(&reply_str) {
+                    Ok(msg) => callback(msg, reply_str.clone()),
+                    Err(e) => println!("ERROR PARSING ResponseWorker: {:?}", e),
+                },
+            ),
         );
 
         let msg = Message::new(id, message_type, data);
@@ -202,6 +234,7 @@ impl PosixContext {
     }
 
     fn handle_messages(
+        worker_id: u64,
         mut manager_stream: UnixStream,
         reply_closures: Arc<Mutex<HashMap<i64, Box<dyn FnOnce(String) + Send>>>>,
     ) {
@@ -224,23 +257,92 @@ impl PosixContext {
                     continue;
                 }
 
-                let msg: Message<serde_json::Value> = serde_json::from_str(line).unwrap();
-
-                if msg.reply_id.is_none() {
-                    // Handle a message sent to us (no reply id means it's not a reply)
-                    continue;
+                // Try to parse it as a reply to a manager action
+                if let Ok(msg) = serde_json::from_str::<Message<serde_json::Value>>(line) {
+                    if let Some(reply_id) = msg.reply_id {
+                        let mut reply_closures = reply_closures.lock().unwrap();
+                        if let Some(callback) = reply_closures.remove(&reply_id) {
+                            callback(line.to_string());
+                        }
+                        continue;
+                    }
                 }
 
-                let mut reply_closures = reply_closures.lock().unwrap();
-                if let Some(callback) = reply_closures.remove(&msg.reply_id.unwrap()) {
-                    callback(line.to_string());
+                // If it wasn't a manager reply, it's a message sent to us
+                if let Ok(msg) = serde_json::from_str::<Message<serde_value::Value>>(line) {
+                    let response = crate::context::invoke_message_callback(msg.message_data);
+                    if let Some(response) = response {
+                        let data = SendWorkerReply {
+                            worker_id: worker_id,
+                            message_data: response,
+                        };
+
+                        let msg =
+                            Message::with_reply(msg.id, msg.id, MessageType::ResponseWorker, data);
+                        let mut msg_str = serde_json::to_string(&msg).unwrap();
+                        msg_str.push('\n');
+                        manager_stream.write_all(msg_str.as_bytes()).ok();
+                    }
                 }
             }
         }
     }
 }
 
-impl DispatchContext for PosixContext {}
+impl DispatchContext for PosixContext {
+    fn spawn_worker(&mut self, role: &str, args: Vec<String>) -> Result<u64, Error> {
+        let data = NewWorkerData {
+            worker_role: role.to_string(),
+            arguments: args,
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send_wrapped_message::<NewWorkerData, NewWorkerReply, _>(
+            data,
+            MessageType::NewWorker,
+            move |msg, _| {
+                tx.send(msg.message_data.worker_id).ok();
+            },
+        )
+        .map_err(|err| {
+            println!("[DEBUG] [new_worker] [posix] err: {:?}", err);
+            crate::error::Error::OperationUnsupported
+        })?;
+
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(reply) => Ok(reply),
+            Err(e) => {
+                println!("[DEBUG] [new_worker] [posix] err: {:?}", e);
+                return Err(crate::error::Error::OperationUnsupported);
+            }
+        }
+    }
+
+    fn send_message(
+        &mut self,
+        worker: &Worker,
+        message: serde_value::Value,
+        callback: Box<dyn FnOnce(serde_value::Value) + Send + 'static>,
+    ) -> Result<(), crate::error::Error> {
+        let data = SendWorkerMessage {
+            worker_id: worker.id(),
+            message_data: message,
+        };
+
+        self.send_wrapped_message::<SendWorkerMessage, serde_value::Value, _>(
+            data,
+            MessageType::SendWorker,
+            |msg, _| {
+                callback(msg.message_data);
+            },
+        )
+        .map_err(|err| {
+            println!("[DEBUG] [send_message] [posix] err: {:?}", err);
+            crate::error::Error::CannotSendWorkerMessage { io_error: err }
+        })?;
+        Ok(())
+    }
+}
 
 impl Allocator for PosixContext {
     fn alloc(&mut self, size: u32) -> Result<u128, crate::error::Error> {
@@ -250,11 +352,15 @@ impl Allocator for PosixContext {
             size: size as i64,
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        self.send_message::<AllocData, AllocReply, _>(data, MessageType::Alloc, move |msg, _| {
-            let alloc_id = (msg.message_data.alloc_id_high as u128) << 64
-                | (msg.message_data.alloc_id_low as u128);
-            tx.send(alloc_id).ok();
-        })
+        self.send_wrapped_message::<AllocData, AllocReply, _>(
+            data,
+            MessageType::Alloc,
+            move |msg, _| {
+                let alloc_id = (msg.message_data.alloc_id_high as u128) << 64
+                    | (msg.message_data.alloc_id_low as u128);
+                tx.send(alloc_id).ok();
+            },
+        )
         .map_err(|err| {
             println!("[DEBUG] [alloc] [posix] err: {:?}", err);
             crate::error::Error::OperationUnsupported
@@ -276,7 +382,7 @@ impl Allocator for PosixContext {
             alloc_id_high: (id >> 64) as u64,
             alloc_id_low: id as u64,
         };
-        self.send_message::<FreeData, (), _>(data, MessageType::Free, |_, _| {})
+        self.send_wrapped_message::<FreeData, (), _>(data, MessageType::Free, |_, _| {})
             .ok();
         self.shmems.remove(&id);
     }
@@ -293,9 +399,13 @@ impl Allocator for PosixContext {
         let size = (id >> 32) as u32;
 
         let (tx, rx) = std::sync::mpsc::channel();
-        self.send_message::<MapIdData, MapIdReply, _>(data, MessageType::MapId, move |msg, _| {
-            tx.send(msg.message_data.os_id).ok();
-        })
+        self.send_wrapped_message::<MapIdData, MapIdReply, _>(
+            data,
+            MessageType::MapId,
+            move |msg, _| {
+                tx.send(msg.message_data.os_id).ok();
+            },
+        )
         .map_err(|err| {
             println!("[DEBUG] [map_id] [posix] err: {:?}", err);
             crate::error::Error::OperationUnsupported

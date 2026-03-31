@@ -8,6 +8,7 @@ pub mod rec;
 pub mod string;
 pub mod sync;
 pub mod vec;
+pub mod worker;
 
 mod header;
 mod mapping;

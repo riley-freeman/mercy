@@ -29,8 +29,6 @@ pub enum Error {
 
     OperationUnsupported,
 
-    ProcessLimitReached,
-
     NoBlocksAvailable {
         requested: usize,
     },
@@ -46,7 +44,11 @@ pub enum Error {
         io_error: std::io::Error,
     },
 
+    ProcessLimitReached,
     CannotStartProcess {
+        io_error: std::io::Error,
+    },
+    CannotSendWorkerMessage {
         io_error: std::io::Error,
     },
 
@@ -82,10 +84,6 @@ impl std::fmt::Display for Error {
 
             Error::OperationUnsupported => write!(f, "Operation not supported on this machine"),
 
-            Error::ProcessLimitReached => {
-                write!(f, "Process has reached its limit of shared memory segments")
-            }
-
             Error::NoBlocksAvailable { requested } => {
                 write!(f, "No blocks available for allocation: {}", requested)
             }
@@ -101,8 +99,14 @@ impl std::fmt::Display for Error {
             }
 
             Error::IoError { io_error } => write!(f, "IO error: {}", io_error),
+            Error::ProcessLimitReached => {
+                write!(f, "Process has reached its limit of shared memory segments")
+            }
             Error::CannotStartProcess { io_error } => {
                 write!(f, "Failed to start process: {}", io_error)
+            }
+            Error::CannotSendWorkerMessage { io_error } => {
+                write!(f, "Failed to send worker message: {}", io_error)
             }
 
             #[cfg(target_os = "linux")]

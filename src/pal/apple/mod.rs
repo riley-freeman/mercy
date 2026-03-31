@@ -144,7 +144,19 @@ impl AppleContext {
     }
 }
 
-impl DispatchContext for AppleContext {}
+impl DispatchContext for AppleContext {
+    fn spawn_worker(&mut self, _role: &str, _args: Vec<String>) -> Result<u64, crate::error::Error> {
+        Err(crate::error::Error::OperationUnsupported)
+    }
+
+    fn send_message(
+        &mut self,
+        _worker: &crate::worker::Worker,
+        _message: serde_value::Value,
+    ) -> Result<(), crate::error::Error> {
+        Err(crate::error::Error::OperationUnsupported)
+    }
+}
 
 impl Allocator for AppleContext {
     fn alloc(&mut self, size: u32) -> Result<u128, crate::error::Error> {

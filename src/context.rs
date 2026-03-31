@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::process::exit;
-use std::sync::MutexGuard;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Mutex, MutexGuard};
 use std::{collections, sync::LazyLock};
 
 use crate::pal::DispatchContext;
@@ -12,6 +12,7 @@ use crate::pal::apple::AppleContext;
 use crate::pal::apple::AppleContext;
 #[cfg(target_os = "linux")]
 use crate::pal::posix::PosixContext;
+use crate::worker::Worker;
 
 use super::error;
 
@@ -174,6 +175,10 @@ impl ContextInner {
     }
 }
 
+static MESSAGE_CALLBACK: LazyLock<
+    Mutex<Box<dyn FnMut(serde_value::Value) -> Option<serde_value::Value> + Send + 'static>>,
+> = LazyLock::new(|| Mutex::new(Box::new(|_| None)));
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Context {
     id_hash: u64,
@@ -199,6 +204,47 @@ impl Context {
         };
         // guard is released, _arc drops here safely
     }
+
+    pub fn worker_id() -> u64 {
+        std::env::var("CRAYON_MERCY_WORKER_ID")
+            .unwrap_or("0".to_string())
+            .parse()
+            .unwrap()
+    }
+
+    pub fn new_worker(&mut self, role: &str, args: Vec<String>) -> Result<Worker, error::Error> {
+        let id = self
+            .inner()
+            .lock()
+            .unwrap()
+            .dispatch
+            .spawn_worker(role, args)?;
+        Ok(Worker::new(self.clone(), id))
+    }
+
+    pub fn send_message(
+        &self,
+        worker: &Worker,
+        message: impl serde::Serialize,
+        callback: impl FnOnce(serde_value::Value) + Send + 'static,
+    ) -> Result<(), error::Error> {
+        self.inner().lock().unwrap().dispatch.send_message(
+            worker,
+            serde_value::to_value(message).unwrap(),
+            Box::new(callback),
+        )
+    }
+
+    pub fn set_message_callback(
+        &mut self,
+        callback: impl FnMut(serde_value::Value) -> Option<serde_value::Value> + Send + 'static,
+    ) {
+        *MESSAGE_CALLBACK.lock().unwrap() = Box::new(callback);
+    }
+}
+
+pub(crate) fn invoke_message_callback(message: serde_value::Value) -> Option<serde_value::Value> {
+    (MESSAGE_CALLBACK.lock().unwrap())(message)
 }
 
 impl crate::alloc::Allocator for Context {

@@ -1,12 +1,15 @@
 use std::{
     collections::{HashMap, LinkedList},
+    env::args,
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     process::exit,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    thread::sleep,
+    time::Duration,
 };
 
 use serde_json::Value;
@@ -14,9 +17,16 @@ use shared_memory::{Shmem, ShmemConf};
 
 use crate::{
     error::Error,
-    message::{AllocData, AllocReply, FreeData, MapIdData, Message, MessageType},
+    message::{
+        AllocData, AllocReply, FreeData, MapIdData, Message, MessageType, NewWorkerData,
+        NewWorkerReply, SendWorkerMessage, SendWorkerReply,
+    },
     pal::posix::{MapIdReply, new_unix_socket_path},
 };
+use std::process::Command;
+
+static WORKERS: LazyLock<Mutex<HashMap<u64, UnixStream>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn start_server(family_id: &str) -> Result<(), Error> {
     let socket_path =
@@ -48,11 +58,24 @@ pub fn start_server(family_id: &str) -> Result<(), Error> {
         }
 
         match stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
                 println!(
                     "[DEBUG] [posix] [server] Accepted connection from {:?}",
                     stream.peer_addr().unwrap()
                 );
+
+                // Register the worker
+                let mut buf = [0; 8];
+                let bytes_read = stream.read(&mut buf).unwrap();
+                if bytes_read == 0 {
+                    continue;
+                }
+
+                let worker_id = u64::from_ne_bytes(buf);
+                WORKERS
+                    .lock()
+                    .unwrap()
+                    .insert(worker_id, stream.try_clone().unwrap());
 
                 // Create a new thread to handle this client's messages.
                 let family_id_clone = String::from(family_id);
@@ -100,7 +123,7 @@ fn handle_client_messages(
     let mut pending = String::new();
 
     loop {
-        let bytes_read = stream.read(&mut buffer).unwrap();
+        let bytes_read = stream.read(&mut buffer).unwrap_or(0);
         if bytes_read == 0 {
             // We want to quit this thread because the connection terminated.
             allocations.clear();
@@ -118,7 +141,7 @@ fn handle_client_messages(
             }
 
             println!("[DEBUG] [posix] [server] Received message: {line}",);
-            let value: Value = serde_json::from_str(line).unwrap();
+            let value: Value = serde_json::from_str(line).expect("Failed to parse message");
 
             let message_type = value.get("message_type").unwrap().as_str().unwrap();
             match message_type {
@@ -149,6 +172,19 @@ fn handle_client_messages(
                     let _ = UnixStream::connect(&socket_path);
                     return;
                 }
+
+                "NewWorker" => {
+                    handle_new_worker_message(serde_json::from_value(value).unwrap(), &mut stream)
+                }
+
+                "SendWorker" => {
+                    handle_send_worker_message(serde_json::from_value(value).unwrap(), &mut stream)
+                }
+
+                "ResponseWorker" => handle_response_worker_message(
+                    serde_json::from_value(value).unwrap(),
+                    &mut stream,
+                ),
 
                 _ => Err(Error::UnexpectedMessageType {
                     message_type: message_type.to_string(),
@@ -256,5 +292,82 @@ fn handle_map_id_message(
     let mut bytes = serde_json::to_vec(&reply).unwrap();
     bytes.push(b'\n');
     stream.write_all(&bytes).unwrap();
+    Ok(())
+}
+
+fn handle_new_worker_message(
+    message: Message<NewWorkerData>,
+    stream: &mut UnixStream,
+) -> Result<(), Error> {
+    static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
+    let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
+
+    let role = message.message_data.worker_role;
+
+    let our_args: Vec<String> = args().collect();
+    let our_command = our_args[0].clone();
+
+    let arguments = message.message_data.arguments;
+
+    let _command = Command::new(our_command)
+        .args(arguments.iter())
+        .env("CRAYON_MERCY_ROLE_NAME", role)
+        .env("CRAYON_MERCY_WORKER_ID", worker_id.to_string())
+        .spawn()
+        .map_err(|e| Error::CannotStartProcess { io_error: e })?;
+
+    while WORKERS.lock().unwrap().get(&worker_id).is_none() {
+        sleep(Duration::from_millis(100));
+    }
+
+    let data = NewWorkerReply { worker_id };
+    let reply = Message::with_reply(message.id, message.id, MessageType::NewWorker, data);
+    let mut bytes = serde_json::to_vec(&reply).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).unwrap();
+    Ok(())
+}
+
+fn handle_send_worker_message(
+    message: Message<SendWorkerMessage>,
+    _stream: &mut UnixStream,
+) -> Result<(), Error> {
+    let worker_id = message.message_data.worker_id;
+    let forwarded_message = Message {
+        id: message.id,
+        reply_id: message.reply_id,
+        message_type: message.message_type,
+        message_data: message.message_data.message_data,
+    };
+
+    if let Some(mut worker) = WORKERS.lock().unwrap().get(&worker_id) {
+        let mut msg_str = serde_json::to_string(&forwarded_message).unwrap();
+        msg_str.push('\n');
+        let _ = worker.write_all(msg_str.as_bytes());
+    } else {
+        eprintln!("[ERROR] [posix] [server] Worker not found: {}", worker_id);
+    }
+    Ok(())
+}
+
+fn handle_response_worker_message(
+    message: Message<SendWorkerReply>,
+    _stream: &mut UnixStream,
+) -> Result<(), Error> {
+    let response_message = Message {
+        id: message.id,
+        reply_id: message.reply_id, // This holds the original request's msg.id
+        message_type: message.message_type,
+        message_data: message.message_data.message_data,
+    };
+
+    let mut msg_str = serde_json::to_string(&response_message).unwrap();
+    msg_str.push('\n');
+
+    let mut workers = WORKERS.lock().unwrap();
+    for (_, worker_stream) in workers.iter_mut() {
+        let _ = worker_stream.write_all(msg_str.as_bytes());
+    }
+
     Ok(())
 }
